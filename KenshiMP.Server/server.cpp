@@ -629,6 +629,8 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
                 entIt->second.owner = id;
                 entIt->second.authority = entIt->second.type == EntityType::PlayerCharacter
                     ? AuthorityType::Player : AuthorityType::Server;
+                // A restarted client begins a fresh position sequence for this ownership session.
+                entIt->second.lastInputSequence = 0;
                 m_players[id].ownedEntities.push_back(eid);
                 reclaimed++;
             }

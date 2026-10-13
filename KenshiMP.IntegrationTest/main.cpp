@@ -1023,6 +1023,13 @@ static void Test_DisconnectCleanup() {
     EntityID bobEntity = client2.myEntityId;
     TestAssert(bobEntity != 0, "Bob has a spawned entity");
 
+    client2.SendPositionUpdate(bobEntity, -51200.f, 1600.f, 2700.f);
+    client2.SendPositionUpdate(bobEntity, -51195.f, 1600.f, 2700.f);
+    bool movedBeforeDisconnect = client2.PollUntil([&]() {
+        return client2.HasPositionSnapshot(bobId, bobEntity, 0, -51195.f, 1600.f, 2700.f);
+    }, 3000);
+    TestAssert(movedBeforeDisconnect, "Bob's second position sample is accepted before disconnect");
+
     // Now Client 2 disconnects
     printf("    Bob disconnecting...\n");
     client2.Disconnect();
@@ -1031,9 +1038,7 @@ static void Test_DisconnectCleanup() {
     // Give server time to process disconnect
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Client 1 should receive:
-    // 1. S2C_EntityDespawn for Bob's entity
-    // 2. S2C_PlayerLeft for Bob
+    // The server retains entities for reconnect and notifies peers via PlayerLeft.
     client1.Poll(2000);
 
     bool gotDespawn = false;
@@ -1043,7 +1048,7 @@ static void Test_DisconnectCleanup() {
             break;
         }
     }
-    TestAssert(gotDespawn, "Client 1 received EntityDespawn for Bob's entity");
+    TestAssert(!gotDespawn, "Bob's entity is preserved for reconnect without an EntityDespawn");
 
     bool gotPlayerLeft = false;
     for (auto& pl : client1.playersLeft) {
@@ -1053,6 +1058,33 @@ static void Test_DisconnectCleanup() {
         }
     }
     TestAssert(gotPlayerLeft, "Client 1 received PlayerLeft for Bob");
+
+    TestClient returningBob;
+    bool reconnectReady = returningBob.Init(client2.name) &&
+        returningBob.Connect("127.0.0.1", KMP_DEFAULT_PORT) &&
+        returningBob.PollUntil([&]() { return returningBob.connected; }, 3000);
+    TestAssert(reconnectReady, "Bob can establish a new connection");
+    if (reconnectReady) {
+        returningBob.SendHandshake();
+        bool reclaimed = returningBob.PollUntil([&]() {
+            return returningBob.handshakeOk &&
+                std::any_of(returningBob.spawnSnapshots.begin(), returningBob.spawnSnapshots.end(),
+                    [&](const auto& snapshot) {
+                        return snapshot.entityId == bobEntity && snapshot.owner == returningBob.playerId;
+                    });
+        }, 3000);
+        TestAssert(reclaimed, "Bob reclaims the same entity under his new player ID without spawning again");
+        if (reclaimed) {
+            returningBob.SendPositionUpdate(bobEntity, -51190.f, 1600.f, 2700.f);
+            bool movedAfterReconnect = returningBob.PollUntil([&]() {
+                return returningBob.HasPositionSnapshot(returningBob.playerId, bobEntity, 0,
+                    -51190.f, 1600.f, 2700.f);
+            }, 3000);
+            TestAssert(movedAfterReconnect, "A restarted client can move with position sequence one after reclaim");
+        }
+        returningBob.Disconnect();
+    }
+    returningBob.Destroy();
 
     client1.Disconnect();
     client1.Destroy();
@@ -1496,23 +1528,24 @@ static void Test_BuildingSync() {
     size_t c2BuildsBefore = c2.buildingsPlaced.size();
     c1.SendBuildRequest(5001, -51200.f, 1600.f, 2710.f);
 
-    // Both should receive building placed
-    bool c1GotBuild = c1.PollUntil([&]() {
-        return !c1.buildingsPlaced.empty();
-    }, 3000);
+    // The builder already owns its local placement; the server relays it to other peers.
     bool c2GotBuild = c2.PollUntil([&]() {
         return c2.buildingsPlaced.size() > c2BuildsBefore;
     }, 3000);
 
-    TestAssert(c1GotBuild, "Client 1 received building placement confirmation");
     TestAssert(c2GotBuild, "Client 2 received building placement broadcast");
+    c1.Poll(300);
+    TestAssert(c1.buildingsPlaced.empty(), "Builder does not receive its own placement as a remote building");
 
     EntityID buildingId = 0;
-    if (c1GotBuild) {
-        auto& bp = c1.buildingsPlaced.back();
+    if (c2GotBuild) {
+        auto& bp = c2.buildingsPlaced.back();
         buildingId = bp.entityId;
+        TestAssert(buildingId != 0, "Placed building has a server entity ID");
         TestAssert(bp.templateId == 5001, "Building template ID matches");
         TestAssert(bp.builderId == c1.playerId, "Builder ID matches Client 1");
+        TestAssert(bp.posX == -51200.f && bp.posY == 1600.f && bp.posZ == 2710.f &&
+            bp.compressedQuat == Quat().Compress(), "Building placement preserves its position and rotation");
         printf("    Building ID: %u, template: %u, builder: %u\n",
                bp.entityId, bp.templateId, bp.builderId);
     }
