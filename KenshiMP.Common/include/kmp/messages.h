@@ -49,6 +49,7 @@ struct MsgPlayerLeft {
 struct CharacterPosition {
     EntityID entityId;
     uint32_t generation;     // Phase 6: prevents ghost control when entity IDs are reused
+    uint32_t inputSequence;  // Client sample sequence, acknowledged by the server
     float    posX, posY, posZ;
     uint32_t compressedQuat; // Smallest-three encoded
     uint8_t  animStateId;
@@ -139,6 +140,7 @@ struct MsgEntityDespawn {
 
 struct MsgHealthUpdate {
     EntityID entityId;
+    uint32_t generation;
     float    health[static_cast<int>(BodyPart::Count)]; // Per body part
     float    bloodLevel;
 };
@@ -159,6 +161,7 @@ struct MsgStatUpdate {
 
 struct MsgLimbHealth {
     EntityID entityId;
+    uint32_t generation;
     float    health[7]; // Per body part: Head, Chest, Stomach, LArm, RArm, LLeg, RLeg
 };
 

@@ -232,6 +232,7 @@ private:
 inline void WriteCharacterPosition(PacketWriter& writer, const CharacterPosition& position) {
     writer.WriteU32(position.entityId);
     writer.WriteU32(position.generation);
+    writer.WriteU32(position.inputSequence);
     writer.WriteF32(position.posX);
     writer.WriteF32(position.posY);
     writer.WriteF32(position.posZ);
@@ -248,6 +249,7 @@ inline bool ReadCharacterPosition(PacketReader& reader, CharacterPosition& posit
     }
 
     return reader.ReadU32(position.entityId) && reader.ReadU32(position.generation) &&
+           reader.ReadU32(position.inputSequence) &&
            reader.ReadVec3(position.posX, position.posY, position.posZ) &&
            reader.ReadU32(position.compressedQuat) && reader.ReadU8(position.animStateId) &&
            reader.ReadU8(position.moveSpeed) && reader.ReadU16(position.flags);

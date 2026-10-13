@@ -16,6 +16,7 @@ struct ClientConfig {
     uint16_t    masterPort     = 27801;               // Master server port
     std::vector<std::string> favoriteServers = {"162.248.94.149:27800"};
     bool        useSyncOrchestrator = false; // New 7-stage sync pipeline (set true to test)
+    bool        syncWorldNpcs = false; // Experimental; local AI decision suppression is unverified
 
     bool Load(const std::string& path);
     bool Save(const std::string& path) const;
@@ -41,3 +42,4 @@ struct ServerConfig {
 };
 
 } // namespace kmp
+
