@@ -32,6 +32,7 @@ struct ServerEntity {
     // Identity
     EntityID    id = 0;
     uint32_t    generation = 0; // NEW: Generation for ghost control prevention
+    uint32_t    lastInputSequence = 0; // Latest processed client position sample
     EntityType  type = EntityType::NPC;
     PlayerID    owner = 0;
 
@@ -196,3 +197,4 @@ bool LoadWorldFromFile(const std::string& path,
                        EntityID& nextEntityId);
 
 } // namespace kmp
+

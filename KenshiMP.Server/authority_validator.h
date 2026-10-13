@@ -17,7 +17,8 @@ public:
     static bool CanClientCommandEntity(
         PlayerID clientPlayerId,
         EntityID entityId,
-        const std::unordered_map<EntityID, ServerEntity>& entities
+        const std::unordered_map<EntityID, ServerEntity>& entities,
+        PlayerID hostPlayerId = INVALID_PLAYER
     );
 
     /// @brief Validates ownership, authority and generation for one position update.
@@ -30,7 +31,8 @@ public:
         PlayerID clientPlayerId,
         EntityID entityId,
         uint32_t generation,
-        const std::unordered_map<EntityID, ServerEntity>& entities
+        const std::unordered_map<EntityID, ServerEntity>& entities,
+        PlayerID hostPlayerId = INVALID_PLAYER
     );
 };
 

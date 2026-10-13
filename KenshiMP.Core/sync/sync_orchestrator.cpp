@@ -500,7 +500,7 @@ void SyncOrchestrator::StagePollAndSendPositions() {
     if (elapsed.count() < KMP_TICK_INTERVAL_MS) return;
     m_lastPollTime = now;
 
-    auto localEntities = m_registry.GetPlayerEntities(m_localPlayerId);
+    auto localEntities = m_registry.GetSimulationEntities(m_localPlayerId, Core::Get().IsHost());
     if (localEntities.empty()) return;
 
     for (EntityID netId : localEntities) {
@@ -522,7 +522,10 @@ void SyncOrchestrator::StagePollAndSendPositions() {
         Vec3 pos = rd.pos;
         Quat rotation = rd.rot;
 
-        if (pos.DistanceTo(infoCopy->lastPosition) < KMP_POS_CHANGE_THRESHOLD) continue;
+        if (infoCopy->ownerPlayerId == INVALID_PLAYER &&
+            pos.DistanceTo(infoCopy->lastPosition) < KMP_POS_CHANGE_THRESHOLD) {
+            continue;
+        }
 
         float elapsedSec = elapsed.count() / 1000.f;
         float dist = pos.DistanceTo(infoCopy->lastPosition);
@@ -559,6 +562,7 @@ void SyncOrchestrator::StagePollAndSendPositions() {
         position.animStateId = animState;
         position.moveSpeed = moveSpeedU8;
         position.flags = flags;
+        Core::Get().TrackPredictedPosition(position);
         WriteCharacterPosition(writer, position);
 
         m_client.SendUnreliable(writer.Data(), writer.Size());

@@ -55,6 +55,8 @@ add_library(KenshiMP.Core SHARED
     sync/authority_validator.cpp
     sync/pending_snapshot_queue.cpp
     sync/deferred_spawn_queue.cpp
+    sync/prediction_reconciliation.cpp
+    sync/world_npc_sync.cpp
     # SDK (polling-based game state + visual proxy)
     sdk/kenshi_sdk.cpp
     sdk/visual_proxy.cpp

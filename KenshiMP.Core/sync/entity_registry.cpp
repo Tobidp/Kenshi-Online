@@ -1,4 +1,5 @@
 #include "entity_registry.h"
+#include "kmp/ai_authority.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 
@@ -29,8 +30,9 @@ EntityID EntityRegistry::Register(void* gameObject, EntityType type, PlayerID ow
     info.ownerPlayerId = owner;
     info.isRemote = false;
     info.state = EntityState::Active;
-    info.authority = AuthorityType::Player; // Player-owned local entity
-    info.localState = LocalAuthorityState::LocalOwned;
+    info.authority = owner == INVALID_PLAYER ? AuthorityType::Server : AuthorityType::Player;
+    info.localState = owner == INVALID_PLAYER ? LocalAuthorityState::ServerOwned
+                                             : LocalAuthorityState::LocalOwned;
 
     m_entities[id] = info;
     m_ptrToId[gameObject] = id;
@@ -60,8 +62,9 @@ EntityID EntityRegistry::RegisterRemote(EntityID netId, EntityType type,
     info.lastPosition = pos;
     info.isRemote = true;
     info.state = EntityState::Spawning;
-    info.authority = AuthorityType::Player; // Assume player-owned remote entity
-    info.localState = LocalAuthorityState::RemoteOwned;
+    info.authority = owner == INVALID_PLAYER ? AuthorityType::Server : AuthorityType::Player;
+    info.localState = owner == INVALID_PLAYER ? LocalAuthorityState::ServerOwned
+                                             : LocalAuthorityState::RemoteOwned;
     info.zone = ZoneCoord::FromWorldPos(pos);
 
     m_entities[netId] = info;
@@ -158,6 +161,28 @@ void EntityRegistry::UpdateOwner(EntityID netId, PlayerID newOwner) {
     auto it = m_entities.find(netId);
     if (it != m_entities.end()) {
         it->second.ownerPlayerId = newOwner;
+        it->second.authority = newOwner == INVALID_PLAYER ? AuthorityType::Server : AuthorityType::Player;
+        it->second.localState = newOwner == INVALID_PLAYER ? LocalAuthorityState::ServerOwned
+            : (it->second.isRemote ? LocalAuthorityState::RemoteOwned : LocalAuthorityState::LocalOwned);
+    }
+}
+
+void EntityRegistry::SetServerSimulation(EntityID netId, bool isHost) {
+    std::unique_lock lock(m_mutex);
+    auto it = m_entities.find(netId);
+    if (it != m_entities.end() && IsWorldNpc(it->second.type, it->second.ownerPlayerId)) {
+        it->second.isRemote = !isHost;
+        it->second.authority = AuthorityType::Server;
+        it->second.localState = LocalAuthorityState::ServerOwned;
+    }
+}
+
+void EntityRegistry::SetSpawnIdentity(EntityID netId, uint32_t templateId, uint32_t factionId) {
+    std::unique_lock lock(m_mutex);
+    auto it = m_entities.find(netId);
+    if (it != m_entities.end()) {
+        it->second.spawnTemplateId = templateId;
+        it->second.spawnFactionId = factionId;
     }
 }
 
@@ -281,6 +306,18 @@ std::vector<EntityID> EntityRegistry::GetPlayerEntities(PlayerID playerId) const
     return result;
 }
 
+std::vector<EntityID> EntityRegistry::GetSimulationEntities(PlayerID localPlayerId, bool isHost) const {
+    std::shared_lock lock(m_mutex);
+    std::vector<EntityID> result;
+    for (const auto& [id, info] : m_entities) {
+        if (CanPublishSimulation(info.type, info.ownerPlayerId, localPlayerId, isHost,
+                                 info.isRemote, info.state, info.gameObject != nullptr)) {
+            result.push_back(id);
+        }
+    }
+    return result;
+}
+
 std::vector<EntityID> EntityRegistry::GetEntitiesInZone(const ZoneCoord& zone) const {
     std::shared_lock lock(m_mutex);
     std::vector<EntityID> result;
@@ -393,3 +430,4 @@ bool EntityRegistry::IsRemote(EntityID netId) const {
 }
 
 } // namespace kmp
+

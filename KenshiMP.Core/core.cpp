@@ -1238,6 +1238,11 @@ void Core::OnLoadingGapDetected() {
         // Without this, a second load would never trigger OnGameLoaded because
         // m_gameLoaded is already true from the first load.
         m_gameLoaded = false;
+        m_sessionEpoch.fetch_add(1);
+        m_reconciliation.Clear();
+        m_worldNpcSync.Reset();
+        combat_hooks::Reset();
+        ai_hooks::ClearRemoteControlled();
         m_initialEntityScanDone = false;
         m_spawnTeleportDone = false;
         m_needPollReset = true; // Reset PollForGameLoad statics on next call
@@ -1873,7 +1878,7 @@ void Core::SendExistingEntitiesToServer() {
                 void* gameObj = reinterpret_cast<void*>(character.GetPtr());
                 if (m_entityRegistry.GetNetId(gameObj) != INVALID_ENTITY) continue;
 
-                EntityID netId = m_entityRegistry.Register(gameObj, EntityType::NPC, m_localPlayerId);
+                EntityID netId = m_entityRegistry.Register(gameObj, EntityType::PlayerCharacter, m_localPlayerId);
                 m_entityRegistry.UpdatePosition(netId, pos);
 
                 Quat rot = character.GetRotation();
@@ -1890,7 +1895,7 @@ void Core::SendExistingEntitiesToServer() {
                 PacketWriter writer;
                 writer.WriteHeader(MessageType::C2S_EntitySpawnReq);
                 writer.WriteU32(netId);
-                writer.WriteU8(static_cast<uint8_t>(EntityType::NPC));
+                writer.WriteU8(static_cast<uint8_t>(EntityType::PlayerCharacter));
                 writer.WriteU32(m_localPlayerId);
                 writer.WriteU32(0);
                 writer.WriteF32(pos.x);
@@ -2223,6 +2228,8 @@ void Core::OnGameTick(float deltaTime) {
     }
 
     // ── Step 0.5: Cleanup old pending snapshots ──
+    m_worldNpcSync.Tick(*this, deltaTime);
+
     // Every 300 ticks (~5 seconds at 60fps), remove position updates older than 10s
     // that were queued for entities that never spawned. Prevents unbounded memory growth.
     {
@@ -2334,6 +2341,9 @@ void Core::OnGameTick(float deltaTime) {
     }
 
     // ── Steps 2-9: Sync pipeline ──
+    combat_hooks::PollHealth(deltaTime);
+    ApplyLocalReconciliation(deltaTime);
+
     if (m_useSyncOrchestrator && m_syncOrchestrator) {
         g_lastTickStep = 2; g_lastStepName = "interpolation";
         WriteBreadcrumb("interpolation", s_tickCallCount, 2);
@@ -2987,7 +2997,7 @@ void Core::PollLocalPositions() {
     if (elapsed.count() < KMP_TICK_INTERVAL_MS) return;
     s_lastPollTime = now;
 
-    auto localEntities = m_entityRegistry.GetPlayerEntities(m_localPlayerId);
+    auto localEntities = m_entityRegistry.GetSimulationEntities(m_localPlayerId, IsHost());
     if (localEntities.empty()) return;
 
     static int s_pollsSent = 0;
@@ -3016,8 +3026,11 @@ void Core::PollLocalPositions() {
             continue;
         }
 
-        // Skip if position hasn't changed enough
-        if (pos.DistanceTo(infoCopy->lastPosition) < KMP_POS_CHANGE_THRESHOLD) continue;
+        // Players need fresh ACKs while stationary; stationary NPCs do not predict local inputs.
+        if (infoCopy->ownerPlayerId == INVALID_PLAYER &&
+            pos.DistanceTo(infoCopy->lastPosition) < KMP_POS_CHANGE_THRESHOLD) {
+            continue;
+        }
 
         // Compute move speed from position delta
         float elapsedSec = elapsed.count() / 1000.f;
@@ -3050,6 +3063,7 @@ void Core::PollLocalPositions() {
         position.animStateId = animState;
         position.moveSpeed = moveSpeedU8;
         position.flags = flags;
+        TrackPredictedPosition(position);
         WriteCharacterPosition(writer, position);
 
         m_client.SendUnreliable(writer.Data(), writer.Size());
@@ -3848,6 +3862,53 @@ bool Core::TeleportToNearestRemotePlayer() {
 
     m_nativeHud.AddSystemMessage("Teleport failed — no valid local characters.");
     return false;
+}
+
+static bool SEH_WritePredictedPosition(void* object, const Vec3& position) {
+    __try {
+        return game::CharacterAccessor(object).WritePosition(position);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void Core::TrackPredictedPosition(CharacterPosition& position) {
+    const auto info = m_entityRegistry.GetInfo(position.entityId);
+    if (!info || info->isRemote || info->ownerPlayerId != GetLocalPlayerId()) {
+        return;
+    }
+    uint32_t sequence = m_nextInputSequence.fetch_add(1);
+    if (sequence == 0) {
+        sequence = m_nextInputSequence.fetch_add(1);
+    }
+    position.inputSequence = sequence;
+    m_reconciliation.RecordLocalInput(
+        position.entityId, position.generation, sequence,
+        Vec3(position.posX, position.posY, position.posZ), Quat::Decompress(position.compressedQuat));
+}
+
+void Core::ApplyLocalReconciliation(float deltaTime) {
+    for (EntityID entityId : m_entityRegistry.GetPlayerEntities(GetLocalPlayerId())) {
+        const auto info = m_entityRegistry.GetInfo(entityId);
+        if (!info || info->isRemote || !info->gameObject) {
+            continue;
+        }
+        Vec3 currentPosition;
+        Quat currentRotation;
+        if (!SEH_ReadPosition(info->gameObject, currentPosition, currentRotation)) {
+            continue;
+        }
+        Vec3 delta;
+        if (!m_reconciliation.GetCorrection(entityId, info->generation, deltaTime, delta)) {
+            continue;
+        }
+        const Vec3 correctedPosition = currentPosition + delta;
+        if (SEH_WritePredictedPosition(info->gameObject, correctedPosition)) {
+            m_entityRegistry.UpdatePosition(entityId, correctedPosition);
+        } else {
+            m_reconciliation.RestoreCorrection(entityId, info->generation, delta);
+        }
+    }
 }
 
 } // namespace kmp

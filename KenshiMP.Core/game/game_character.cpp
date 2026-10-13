@@ -1,5 +1,6 @@
 #include "game_types.h"
 #include "game_offset_prober.h"
+#include "kmp/health_sync.h"
 #include "kmp/memory.h"
 #include <spdlog/spdlog.h>
 #include <chrono>
@@ -189,31 +190,141 @@ Quat CharacterAccessor::GetRotation() const {
     return rot;
 }
 
-float CharacterAccessor::GetHealth(BodyPart part) const {
-    auto& offsets = GetOffsets().character;
+static bool IsHealthPointerValid(uintptr_t address) {
+    return address >= 0x10000 && address <= 0x00007FFFFFFFFFFF;
+}
 
-    // Method 1: Direct offset (if scanner found it)
+static bool ResolveLimbHealthAddress(uintptr_t character, uintptr_t& healthAddress) {
+    const auto& offsets = GetOffsets().character;
+    if (!IsHealthPointerValid(character) ||
+        (offsets.healthStride != sizeof(float) && offsets.healthStride != 2 * sizeof(float))) {
+        return false;
+    }
+
     if (offsets.health >= 0) {
-        float health = 0.f;
-        Memory::Read(m_ptr + offsets.health + static_cast<int>(part) * offsets.healthStride, health);
-        return health;
+        healthAddress = character + offsets.health;
+        return IsHealthPointerValid(healthAddress);
     }
 
-    // Method 2: CE pointer chain: char+2B8 -> +5F8 -> +40 + (part * stride)
-    if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-        uintptr_t ptr1 = 0;
-        if (!Memory::Read(m_ptr + offsets.healthChain1, ptr1) || ptr1 == 0) return 0.f;
+    if (offsets.healthChain1 < 0 || offsets.healthChain2 < 0 || offsets.healthBase < 0) {
+        return false;
+    }
+    uintptr_t first = 0;
+    if (!Memory::Read(character + offsets.healthChain1, first) || !IsHealthPointerValid(first)) {
+        return false;
+    }
+    uintptr_t second = 0;
+    if (!Memory::Read(first + offsets.healthChain2, second) || !IsHealthPointerValid(second)) {
+        return false;
+    }
+    healthAddress = second + offsets.healthBase;
+    return IsHealthPointerValid(healthAddress);
+}
 
-        uintptr_t ptr2 = 0;
-        if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0) return 0.f;
+static bool IsHealthSpanWritable(uintptr_t address, size_t size) {
+    uintptr_t end = address + size;
+    if (end <= address || !IsHealthPointerValid(end - 1)) {
+        return false;
+    }
+    while (address < end) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) == 0 ||
+            region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+        DWORD protection = region.Protect & 0xFF;
+        if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+            protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) {
+            return false;
+        }
+        uintptr_t next = reinterpret_cast<uintptr_t>(region.BaseAddress) + region.RegionSize;
+        if (next <= address) {
+            return false;
+        }
+        address = next;
+    }
+    return true;
+}
 
-        float health = 0.f;
-        int partOffset = offsets.healthBase + static_cast<int>(part) * offsets.healthStride;
-        Memory::Read(ptr2 + partOffset, health);
-        return health;
+template<int ValueCount>
+struct LimbHealthMemorySpan {
+    float values[ValueCount];
+};
+
+template<int ValueCount>
+static bool ReadLimbHealthSpan(uintptr_t address, int stride, float outHealth[KMP_LIMB_COUNT]) {
+    LimbHealthMemorySpan<ValueCount> snapshot{};
+    if (!Memory::Read(address, snapshot)) {
+        return false;
+    }
+    float health[KMP_LIMB_COUNT];
+    for (int limb = 0; limb < KMP_LIMB_COUNT; limb++) {
+        health[limb] = snapshot.values[limb * stride];
+    }
+    if (!IsFiniteLimbHealth(health)) {
+        return false;
+    }
+    for (int limb = 0; limb < KMP_LIMB_COUNT; limb++) {
+        outHealth[limb] = health[limb];
+    }
+    return true;
+}
+
+bool CharacterAccessor::ReadLimbHealth(float outHealth[KMP_LIMB_COUNT]) const {
+    if (!outHealth) {
+        return false;
+    }
+    uintptr_t address = 0;
+    if (!ResolveLimbHealthAddress(m_ptr, address)) {
+        return false;
+    }
+    if (GetOffsets().character.healthStride == sizeof(float)) {
+        return ReadLimbHealthSpan<KMP_LIMB_COUNT>(address, 1, outHealth);
+    }
+    return ReadLimbHealthSpan<KMP_LIMB_COUNT * 2 - 1>(address, 2, outHealth);
+}
+
+template<int ValueCount>
+static bool WriteLimbHealthSpan(uintptr_t character, uintptr_t address, int stride,
+                                const float health[KMP_LIMB_COUNT]) {
+    LimbHealthMemorySpan<ValueCount> snapshot{};
+    if (!IsHealthSpanWritable(address, sizeof(snapshot)) || !Memory::Read(address, snapshot)) {
+        return false;
+    }
+    for (int limb = 0; limb < KMP_LIMB_COUNT; limb++) {
+        snapshot.values[limb * stride] = health[limb];
     }
 
-    return 0.f;
+    // Resolve again immediately before the single span write. A zone transition must
+    // not redirect a partially applied snapshot to an obsolete health allocation.
+    uintptr_t currentAddress = 0;
+    if (!ResolveLimbHealthAddress(character, currentAddress) || currentAddress != address) {
+        return false;
+    }
+    return Memory::Write(address, snapshot);
+}
+
+bool CharacterAccessor::WriteLimbHealth(const float health[KMP_LIMB_COUNT]) {
+    if (!IsFiniteLimbHealth(health)) {
+        return false;
+    }
+    uintptr_t address = 0;
+    if (!ResolveLimbHealthAddress(m_ptr, address)) {
+        return false;
+    }
+    if (GetOffsets().character.healthStride == sizeof(float)) {
+        return WriteLimbHealthSpan<KMP_LIMB_COUNT>(m_ptr, address, 1, health);
+    }
+    return WriteLimbHealthSpan<KMP_LIMB_COUNT * 2 - 1>(m_ptr, address, 2, health);
+}
+
+float CharacterAccessor::GetHealth(BodyPart part) const {
+    int limb = static_cast<int>(part);
+    float health[KMP_LIMB_COUNT];
+    if (limb < 0 || limb >= KMP_LIMB_COUNT || !ReadLimbHealth(health)) {
+        return 0.f;
+    }
+    return health[limb];
 }
 
 bool CharacterAccessor::IsAlive() const {
@@ -1002,3 +1113,4 @@ void SetGameLoadingState(bool loading) {
 }
 
 } // namespace kmp::game
+

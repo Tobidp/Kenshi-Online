@@ -364,6 +364,13 @@ public:
     Vec3 GetPosition() const;
     Quat GetRotation() const;
     float GetHealth(BodyPart part) const;
+
+    /// Reads all seven limbs, preserving the output on an invalid or unreadable health chain.
+    bool ReadLimbHealth(float outHealth[7]) const;
+
+    /// Writes a validated health snapshot on the game thread, preserving interleaved stun values.
+    bool WriteLimbHealth(const float health[7]);
+
     bool IsAlive() const;
     bool IsPlayerControlled() const;
     float GetMoveSpeed() const;
@@ -660,3 +667,4 @@ using GunTurretFireFn     = void(__fastcall*)(void* turret, void* target);
 } // namespace func_types
 
 } // namespace kmp::game
+

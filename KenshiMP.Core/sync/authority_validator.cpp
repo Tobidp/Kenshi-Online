@@ -48,6 +48,11 @@ SnapshotDecision AuthorityValidator::ValidateInboundSnapshot(
         return SnapshotDecision::ReconcileLocal;
     }
 
+    if (ownerPlayerId == INVALID_PLAYER && !info.isRemote &&
+        info.localState == LocalAuthorityState::ServerOwned) {
+        return SnapshotDecision::RejectEcho;
+    }
+
     // 4c. Remote or server-owned entity with valid owner → apply
     if (registry.IsRemote(pos.entityId)) {
         return SnapshotDecision::ApplyRemote;

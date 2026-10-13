@@ -1,4 +1,6 @@
 #include "../core.h"
+#include "kmp/health_sync.h"
+#include "kmp/ai_authority.h"
 #include "../game/game_types.h"
 #include "../game/game_inventory.h"
 #include "../game/spawn_manager.h"
@@ -19,6 +21,7 @@
 #include "kmp/memory.h"
 #include "kmp/string_convert.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <cmath>
 #include <unordered_set>
 
@@ -26,8 +29,6 @@ namespace kmp {
 
 // Forward declarations for game function call types
 // NOTE: CharacterMoveTo removed — pattern scanner found mid-function address, not safe to call
-using ApplyDamageFn = void(__fastcall*)(void* target, void* attacker,
-                                         int bodyPart, float cut, float blunt, float pierce);
 using CharacterDeathFn = void(__fastcall*)(void* character, void* killer);
 
 // ── SEH helpers for mod character link initialization ──
@@ -108,6 +109,34 @@ static bool SEH_WriteLimbHealthToChar(void* character, const float health[7]) {
 }
 
 // Handles incoming packets from the server and dispatches to appropriate systems.
+static void QueueLimbHealthUpdate(EntityID entityId, uint32_t generation,
+                                 const float health[KMP_LIMB_COUNT]) {
+    if (!IsFiniteLimbHealth(health)) {
+        return;
+    }
+    MsgLimbHealth snapshot{};
+    snapshot.entityId = entityId;
+    snapshot.generation = generation;
+    std::copy(health, health + KMP_LIMB_COUNT, snapshot.health);
+    const uint64_t sessionEpoch = Core::Get().GetSessionEpoch();
+    Core::Get().GetCommandQueue().Push({[snapshot, sessionEpoch]() {
+        auto& core = Core::Get();
+        auto& registry = core.GetEntityRegistry();
+        const auto info = registry.GetInfo(snapshot.entityId);
+        if (!core.IsConnected() || core.GetSessionEpoch() != sessionEpoch ||
+            !core.IsGameLoaded() || !info || info->generation != snapshot.generation ||
+            !info->gameObject) {
+            return;
+        }
+        if (game::CharacterAccessor(info->gameObject).WriteLimbHealth(snapshot.health)) {
+            registry.UpdateLimbHealth(snapshot.entityId, snapshot.health);
+        } else {
+            spdlog::debug("Health snapshot deferred: entity {} generation {} has no writable health",
+                          snapshot.entityId, snapshot.generation);
+        }
+    }});
+}
+
 class PacketHandler {
 public:
     static void Initialize() {
@@ -567,6 +596,38 @@ private:
         Vec3 spawnPos(px, py, pz);
         Quat rot = Quat::Decompress(compQuat);
 
+        if (IsWorldNpc(static_cast<EntityType>(type), ownerId)) {
+            if (!core.GetConfig().syncWorldNpcs) {
+                return;
+            }
+            if (core.IsHost()) {
+                EntityID match = INVALID_ENTITY;
+                bool ambiguous = false;
+                for (EntityID candidate : registry.GetPlayerEntities(INVALID_PLAYER)) {
+                    const auto info = registry.GetInfo(candidate);
+                    if (!info || info->isRemote || info->spawnTemplateId != templateId ||
+                        info->spawnFactionId != factionId ||
+                        info->lastPosition.DistanceTo(spawnPos) > KMP_NPC_LINK_RADIUS) {
+                        continue;
+                    }
+                    if (match != INVALID_ENTITY) {
+                        ambiguous = true;
+                        break;
+                    }
+                    match = candidate;
+                }
+                if (!ambiguous && match != INVALID_ENTITY && match != entityId) {
+                    registry.RemapEntityId(match, entityId);
+                }
+                return;
+            }
+            registry.RegisterRemote(entityId, static_cast<EntityType>(type), ownerId, spawnPos);
+            registry.SetSpawnIdentity(entityId, templateId, factionId);
+            core.GetWorldNpcSync().QueueExistingNpc(entityId, 0, templateId, factionId, spawnPos);
+            core.GetInterpolation().AddSnapshot(entityId, SessionTime(), spawnPos, rot);
+            return;
+        }
+
         // If this is our own entity being confirmed by the server, remap the
         // local entity ID to the server-assigned ID instead of spawning a duplicate.
         if (ownerId == core.GetLocalPlayerId()) {
@@ -818,6 +879,7 @@ private:
         core.GetEntityRegistry().SetGameObject(entityId, nullptr);
         core.GetInterpolation().RemoveEntity(entityId);
         core.GetEntityRegistry().Unregister(entityId);
+        core.GetReconciliation().RemoveEntity(entityId);
     }
 
     // ── Position Update ──
@@ -880,8 +942,7 @@ private:
                     break;
 
                 case SnapshotDecision::ReconcileLocal:
-                    // TODO: Implement prediction reconciliation (Phase 7)
-                    // For now, skip to prevent rubber-banding
+                    core.GetReconciliation().ReconcileSnapshot(pos, position);
                     reconciledLocal++;
                     break;
 
@@ -933,81 +994,38 @@ private:
 
     // ── Combat Hit ──
     static void HandleCombatHit(PacketReader& reader) {
-        MsgCombatHit msg;
-        if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-        // Validate body part to prevent out-of-bounds memory writes
-        if (msg.bodyPart >= static_cast<uint8_t>(BodyPart::Count)) return;
-
-        spdlog::debug("PacketHandler: Combat hit {} -> {} part={} dmg=({:.1f},{:.1f},{:.1f}) hp={:.1f}",
-                      msg.attackerId, msg.targetId, msg.bodyPart,
-                      msg.cutDamage, msg.bluntDamage, msg.pierceDamage, msg.resultHealth);
-
+        MsgCombatHit msg{};
+        if (!reader.ReadRaw(&msg, sizeof(msg)) ||
+            msg.bodyPart >= static_cast<uint8_t>(BodyPart::Count) ||
+            !std::isfinite(msg.resultHealth)) {
+            return;
+        }
         auto& core = Core::Get();
-        if (!core.IsGameLoaded()) return;
-        auto& registry = core.GetEntityRegistry();
-        auto& funcs = core.GetGameFunctions();
-
-        void* targetObj = registry.GetGameObject(msg.targetId);
-        if (!targetObj) return;
-
-        bool appliedViaFunction = false;
-
-        // Try to apply damage via the game's native damage function.
-        // ApplyDamage dereferences attacker, so only call with a valid attacker.
-        // FIXED: Queue all game memory writes for game thread execution
-        // Capture by VALUE only - references would be stale when command executes
-        core.GetCommandQueue().Push({[targetObj, msg]() {
+        const auto info = core.GetEntityRegistry().GetInfo(msg.targetId);
+        if (!info || !core.IsGameLoaded()) {
+            return;
+        }
+        const uint32_t generation = info->generation;
+        const uint64_t sessionEpoch = core.GetSessionEpoch();
+        core.GetCommandQueue().Push({[msg, generation, sessionEpoch]() {
             auto& core = Core::Get();
-            auto& funcs = core.GetGameFunctions();
             auto& registry = core.GetEntityRegistry();
-            bool appliedViaFunction = false;
-
-            if (funcs.ApplyDamage) {
-                void* attackerObj = (msg.attackerId != INVALID_ENTITY)
-                    ? registry.GetGameObject(msg.attackerId) : nullptr;
-                if (attackerObj) {
-                    auto damageFn = reinterpret_cast<ApplyDamageFn>(funcs.ApplyDamage);
-                    __try {
-                        damageFn(targetObj, attackerObj, msg.bodyPart,
-                                 msg.cutDamage, msg.bluntDamage, msg.pierceDamage);
-                        appliedViaFunction = true;
-                    } __except (EXCEPTION_EXECUTE_HANDLER) {
-                        spdlog::warn("PacketHandler: Native ApplyDamage crashed for {} -> {} — using fallback",
-                                     msg.attackerId, msg.targetId);
-                    }
-                }
+            const auto current = registry.GetInfo(msg.targetId);
+            if (!core.IsConnected() || core.GetSessionEpoch() != sessionEpoch ||
+                !core.IsGameLoaded() || !current || current->generation != generation ||
+                !current->gameObject) {
+                return;
             }
-
-            // Fallback: write health directly to character memory
-            if (!appliedViaFunction) {
-                auto& offsets = game::GetOffsets().character;
-                uintptr_t charPtr = reinterpret_cast<uintptr_t>(targetObj);
-
-                if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                    uintptr_t ptr1 = 0;
-                    if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                        uintptr_t ptr2 = 0;
-                        if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                            int partOffset = offsets.healthBase +
-                                static_cast<int>(msg.bodyPart) * offsets.healthStride;
-                            Memory::Write(ptr2 + partOffset, msg.resultHealth);
-                        }
-                    }
-                }
+            float health[KMP_LIMB_COUNT];
+            game::CharacterAccessor character(current->gameObject);
+            if (!character.ReadLimbHealth(health)) {
+                return;
+            }
+            health[msg.bodyPart] = msg.resultHealth;
+            if (character.WriteLimbHealth(health)) {
+                registry.UpdateLimbHealth(msg.targetId, health);
             }
         }});
-
-        // Update entity registry with the new limb health value
-        {
-            auto info = registry.GetInfo(msg.targetId);
-            if (info.has_value()) {
-                float limbs[7];
-                for (int i = 0; i < 7; i++) limbs[i] = info->limbs.hp[i];
-                if (msg.bodyPart < 7) limbs[msg.bodyPart] = msg.resultHealth;
-                registry.UpdateLimbHealth(msg.targetId, limbs);
-            }
-        }
     }
 
     // ── Combat Death ──
@@ -1415,78 +1433,20 @@ private:
 
     // ── Health Update ──
     static void HandleHealthUpdate(PacketReader& reader) {
-        MsgHealthUpdate msg;
-        if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-        auto& core = Core::Get();
-        if (!core.IsGameLoaded()) return;
-        auto& registry = core.GetEntityRegistry();
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (!entityObj) return;
-
-        // Write health values directly to the character's health memory
-        auto& offsets = game::GetOffsets().character;
-        uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-        if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-            __try {
-                uintptr_t ptr1 = 0;
-                if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                    uintptr_t ptr2 = 0;
-                    if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                        for (int i = 0; i < static_cast<int>(BodyPart::Count); i++) {
-                            int partOffset = offsets.healthBase + i * offsets.healthStride;
-                            Memory::Write(ptr2 + partOffset, msg.health[i]);
-                        }
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                spdlog::warn("PacketHandler: SEH exception writing health update for entity {}", msg.entityId);
-            }
+        MsgHealthUpdate msg{};
+        if (!reader.ReadRaw(&msg, sizeof(msg))) {
+            return;
         }
-
-        // Update entity registry with the health values
-        registry.UpdateLimbHealth(msg.entityId, msg.health);
+        QueueLimbHealthUpdate(msg.entityId, msg.generation, msg.health);
     }
 
     // ── Limb Health ──
     static void HandleLimbHealth(PacketReader& reader) {
-        MsgLimbHealth msg;
-        if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-        auto& core = Core::Get();
-        if (!core.IsGameLoaded()) return;
-
-        // Store limb health in entity registry
-        auto& registry = core.GetEntityRegistry();
-        registry.UpdateLimbHealth(msg.entityId, msg.health);
-
-        // Write limb health values to the game character's memory
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (entityObj) {
-            auto& offsets = game::GetOffsets().character;
-            uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-            if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                __try {
-                    uintptr_t ptr1 = 0;
-                    if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                        uintptr_t ptr2 = 0;
-                        if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                            for (int i = 0; i < 7; i++) {
-                                int partOffset = offsets.healthBase + i * offsets.healthStride;
-                                Memory::Write(ptr2 + partOffset, msg.health[i]);
-                            }
-                        }
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    spdlog::warn("PacketHandler: SEH exception writing limb health for entity {}", msg.entityId);
-                }
-            }
+        MsgLimbHealth msg{};
+        if (!reader.ReadRaw(&msg, sizeof(msg))) {
+            return;
         }
-
-        spdlog::debug("PacketHandler: Limb health for entity {} (chest={:.1f})",
-                      msg.entityId, msg.health[static_cast<int>(BodyPart::Chest)]);
+        QueueLimbHealthUpdate(msg.entityId, msg.generation, msg.health);
     }
 
     // ── Status Effect ──

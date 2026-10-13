@@ -1,4 +1,5 @@
 #include "authority_validator.h"
+#include "kmp/ai_authority.h"
 #include <spdlog/spdlog.h>
 
 namespace kmp {
@@ -6,7 +7,8 @@ namespace kmp {
 bool ServerAuthorityValidator::CanClientCommandEntity(
     PlayerID clientPlayerId,
     EntityID entityId,
-    const std::unordered_map<EntityID, ServerEntity>& entities
+    const std::unordered_map<EntityID, ServerEntity>& entities,
+    PlayerID hostPlayerId
 ) {
     // 1. Check if entity exists
     auto it = entities.find(entityId);
@@ -25,17 +27,14 @@ bool ServerAuthorityValidator::CanClientCommandEntity(
         return false;
     }
 
-    // 3. Check authority type (only Player-owned entities can be commanded by clients)
-    if (entity.authority != AuthorityType::Player) {
+    // World NPCs have one simulation authority: the current host.
+    const bool playerAuthority = entity.authority == AuthorityType::Player;
+    const bool worldAuthority = entity.authority == AuthorityType::Server &&
+                                IsWorldNpc(entity.type, entity.owner);
+    if ((!playerAuthority && !worldAuthority) ||
+        !CanSimulateActor(entity.type, entity.owner, clientPlayerId, hostPlayerId)) {
         spdlog::warn("[ServerAuth] Player {} tried to command non-player entity {} (authority={})",
                      clientPlayerId, entityId, static_cast<int>(entity.authority));
-        return false;
-    }
-
-    // 4. Check ownership match
-    if (entity.owner != clientPlayerId) {
-        spdlog::warn("[ServerAuth] AUTHORITY VIOLATION: Player {} tried to command entity {} owned by player {}",
-                     clientPlayerId, entityId, entity.owner);
         return false;
     }
 
@@ -46,9 +45,10 @@ bool ServerAuthorityValidator::ValidatePositionUpdate(
     PlayerID clientPlayerId,
     EntityID entityId,
     uint32_t generation,
-    const std::unordered_map<EntityID, ServerEntity>& entities
+    const std::unordered_map<EntityID, ServerEntity>& entities,
+    PlayerID hostPlayerId
 ) {
-    if (!CanClientCommandEntity(clientPlayerId, entityId, entities)) {
+    if (!CanClientCommandEntity(clientPlayerId, entityId, entities, hostPlayerId)) {
         return false;
     }
 

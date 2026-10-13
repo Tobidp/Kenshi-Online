@@ -14,6 +14,8 @@ struct EntityInfo {
     void*         gameObject = nullptr;
     EntityType    type = EntityType::NPC;
     PlayerID      ownerPlayerId = 0; // 0 = server-owned
+    uint32_t spawnTemplateId = 0;
+    uint32_t spawnFactionId = 0;
 
     // State & authority (spec §2.2, §2.3)
     EntityState   state     = EntityState::Inactive;
@@ -68,6 +70,10 @@ public:
     // Update entity owner (for ownership transfer)
     void UpdateOwner(EntityID netId, PlayerID newOwner);
 
+    /// Sets whether a server-owned NPC is simulated here after a host assignment.
+    void SetServerSimulation(EntityID netId, bool isHost);
+    void SetSpawnIdentity(EntityID netId, uint32_t templateId, uint32_t factionId);
+
     // Update equipment tracking for a single slot
     void UpdateEquipment(EntityID netId, int slot, uint32_t itemTemplateId);
 
@@ -97,6 +103,9 @@ public:
 
     // Get all entities owned by a player
     std::vector<EntityID> GetPlayerEntities(PlayerID playerId) const;
+
+    /// Returns active physical characters this client may publish (including host NPCs).
+    std::vector<EntityID> GetSimulationEntities(PlayerID localPlayerId, bool isHost) const;
 
     // Get all entities in a zone
     std::vector<EntityID> GetEntitiesInZone(const ZoneCoord& zone) const;
@@ -143,3 +152,4 @@ private:
 };
 
 } // namespace kmp
+

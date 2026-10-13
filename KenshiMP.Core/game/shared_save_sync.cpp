@@ -302,6 +302,7 @@ void Update(float deltaTime) {
             cp.animStateId = entityInfo->animState;
             cp.moveSpeed = entityInfo->moveSpeed;
             cp.flags = 0;
+            core.TrackPredictedPosition(cp);
             WriteCharacterPosition(writer, cp);
 
             core.GetClient().SendUnreliable(writer.Data(), writer.Size());

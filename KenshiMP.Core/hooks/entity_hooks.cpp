@@ -505,7 +505,7 @@ static SEH_EntityInfo SEH_ReadAndRegisterEntity(void* character, void* templateD
 
         info.owner = coreRef.GetLocalPlayerId();
         info.netId = coreRef.GetEntityRegistry().Register(
-            character, EntityType::NPC, info.owner);
+            character, EntityType::PlayerCharacter, info.owner);
         coreRef.GetEntityRegistry().UpdatePosition(info.netId, info.charData.position);
 
         info.templateId = 0;
@@ -555,7 +555,7 @@ static void SEH_ConnectedPostProcess(void* character, void* templateData, int co
     PacketWriter writer;
     writer.WriteHeader(MessageType::C2S_EntitySpawnReq);
     writer.WriteU32(info.netId);
-    writer.WriteU8(static_cast<uint8_t>(EntityType::NPC));
+    writer.WriteU8(static_cast<uint8_t>(EntityType::PlayerCharacter));
     writer.WriteU32(info.owner);
     writer.WriteU32(info.templateId);
     writer.WriteF32(info.charData.position.x);
@@ -921,7 +921,7 @@ static void* __fastcall Hook_CharacterCreate(void* factory, void* templateData) 
         // animations — zero crash risk from faction pointer issues.
         // We just: register it, teleport it to the remote player's position,
         // rename it, and disable its AI.
-        if (character && coreRef.IsGameLoaded()) {
+        if (character && coreRef.IsGameLoaded() && !coreRef.GetConfig().syncWorldNpcs) {
             auto& spawnMgr = coreRef.GetSpawnManager();
             SpawnRequest spawnReq;
             if (spawnMgr.PopNextSpawn(spawnReq)) {
@@ -1579,3 +1579,4 @@ int GetCapturedModTemplates(void** outPtrs, int maxCount) {
 }
 
 } // namespace kmp::entity_hooks
+

@@ -1,162 +1,150 @@
 #include "ai_hooks.h"
-#include "kmp/hook_manager.h"
-#include "kmp/patterns.h"
 #include "../core.h"
-#include "../game/game_types.h"
+#include "kmp/hook_manager.h"
 #include <spdlog/spdlog.h>
-#include <unordered_set>
+#include <atomic>
 #include <mutex>
+#include <unordered_set>
 
 namespace kmp::ai_hooks {
 
-// ── Function typedefs ──
-using AICreateFn   = void*(__fastcall*)(void* character, void* faction);
+using AICreateFn = void*(__fastcall*)(void* character, void* faction);
 using AIPackagesFn = void(__fastcall*)(void* character, void* aiPackage);
 
-// ── State ──
-static AICreateFn   s_origAICreate   = nullptr;
-static AIPackagesFn s_origAIPackages = nullptr;
-static int s_createCount = 0;
-static int s_packageCount = 0;
-
-// ── Remote-controlled character tracking ──
-// Characters in this set have their AI decisions overridden by network input.
-// The AI CONTROLLER is kept valid (no nullptr!) so the engine doesn't crash
-// when downstream code dereferences it. Only the AI DECISIONS are suppressed.
-static std::unordered_set<void*> s_remoteControlled;
-static std::mutex s_remoteMutex;
+static AICreateFn g_origAICreate = nullptr;
+static AIPackagesFn g_origAIPackages = nullptr;
+static std::atomic<int> g_createCount{0};
+static std::atomic<int> g_packageCount{0};
+static std::unordered_set<void*> g_remoteControlled;
+static std::mutex g_remoteMutex;
 
 void MarkRemoteControlled(void* character) {
-    std::lock_guard lock(s_remoteMutex);
-    s_remoteControlled.insert(character);
-    spdlog::info("ai_hooks: Marked character 0x{:X} as remote-controlled ({} total)",
-                 (uintptr_t)character, s_remoteControlled.size());
+    if (!character) {
+        return;
+    }
+    std::lock_guard lock(g_remoteMutex);
+    if (g_remoteControlled.insert(character).second) {
+        spdlog::debug("ai_hooks: Tracking replicated character 0x{:X} ({} total)",
+                      reinterpret_cast<uintptr_t>(character), g_remoteControlled.size());
+    }
 }
 
 void UnmarkRemoteControlled(void* character) {
-    std::lock_guard lock(s_remoteMutex);
-    s_remoteControlled.erase(character);
+    std::lock_guard lock(g_remoteMutex);
+    g_remoteControlled.erase(character);
 }
 
 bool IsRemoteControlled(void* character) {
-    std::lock_guard lock(s_remoteMutex);
-    return s_remoteControlled.count(character) > 0;
+    std::lock_guard lock(g_remoteMutex);
+    return character && g_remoteControlled.count(character) > 0;
 }
 
-// ── Hooks ──
+void ClearRemoteControlled() {
+    std::lock_guard lock(g_remoteMutex);
+    g_remoteControlled.clear();
+}
 
-static void* __fastcall Hook_AICreate(void* character, void* faction) {
-    s_createCount++;
-
-    // ALWAYS call the original AICreate — every character needs a valid AI controller.
-    // Returning nullptr here was the root cause of crashes when interacting with
-    // remote characters: downstream code dereferences the AI controller without
-    // null checks (combat, pathfinding, animation state transitions, UI selection).
-    void* result = nullptr;
-    __try {
-        result = s_origAICreate(character, faction);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        spdlog::error("ai_hooks: AICreate crashed");
+// Keep SEH boundaries free of C++ objects that require stack unwinding (MSVC C2712).
+static void* CallAICreate(void* character, void* faction) {
+    if (!g_origAICreate) {
         return nullptr;
     }
+    __try {
+        return g_origAICreate(character, faction);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        spdlog::error("ai_hooks: AICreate crashed, char=0x{:X}",
+                      reinterpret_cast<uintptr_t>(character));
+        return nullptr;
+    }
+}
 
+static bool CallAIPackages(void* character, void* aiPackage) {
+    if (!g_origAIPackages) {
+        return false;
+    }
+    __try {
+        g_origAIPackages(character, aiPackage);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        spdlog::error("ai_hooks: AIPackages crashed, char=0x{:X}",
+                      reinterpret_cast<uintptr_t>(character));
+        return false;
+    }
+}
+
+static void TrackRegisteredCharacter(void* character) {
     auto& core = Core::Get();
-    if (!core.IsConnected()) return result;
-
-    // Check if this is a remote player's character — if so, mark it for
-    // AI decision override (movement/tasks blocked, driven by network instead).
-    // The AI controller itself stays VALID — only decisions are suppressed.
+    if (!core.IsConnected() || !character) {
+        return;
+    }
     auto& registry = core.GetEntityRegistry();
-    EntityID netId = registry.GetNetId(character);
-    if (netId != INVALID_ENTITY) {
-        auto info = registry.GetInfo(netId);
-        if (info.has_value() && info->isRemote) {
-            MarkRemoteControlled(character);
-            spdlog::info("ai_hooks: AICreate for remote entity {} — AI controller CREATED "
-                         "(decisions will be overridden by network), char=0x{:X}",
-                         netId, (uintptr_t)character);
-        }
+    auto info = registry.GetInfo(registry.GetNetId(character));
+    if (info.has_value() && info->isRemote) {
+        MarkRemoteControlled(character);
+    } else {
+        UnmarkRemoteControlled(character);
     }
+}
 
-    if (s_createCount % 100 == 1) {
+static void* __fastcall Hook_AICreate(void* character, void* faction) {
+    // Every character needs a valid controller for combat, pathfinding and animation.
+    // Tracking a replica must never cause this initialization to return nullptr.
+    void* result = CallAICreate(character, faction);
+    TrackRegisteredCharacter(character);
+    int createCount = ++g_createCount;
+    if (createCount % 100 == 1) {
         spdlog::debug("ai_hooks: AICreate #{} (char=0x{:X}, faction=0x{:X})",
-                       s_createCount, (uintptr_t)character, (uintptr_t)faction);
+                      createCount, reinterpret_cast<uintptr_t>(character),
+                      reinterpret_cast<uintptr_t>(faction));
     }
-
     return result;
 }
 
 static void __fastcall Hook_AIPackages(void* character, void* aiPackage) {
-    s_packageCount++;
-
-    // ALWAYS let AI packages load — the character needs valid behavior trees
-    // to prevent crashes when the engine queries them. Even for remote characters,
-    // the behavior tree structure must exist; we just override the actual decisions.
-    __try {
-        s_origAIPackages(character, aiPackage);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        spdlog::error("ai_hooks: AIPackages crashed");
+    // This loads behavior data. It is not an AI update hook and cannot gate decisions.
+    if (!CallAIPackages(character, aiPackage)) {
         return;
     }
-
-    auto& core = Core::Get();
-    if (!core.IsConnected()) return;
-
-    // Log for remote characters (diagnostic only — no suppression)
-    auto& registry = core.GetEntityRegistry();
-    EntityID netId = registry.GetNetId(character);
-    if (netId != INVALID_ENTITY) {
-        auto info = registry.GetInfo(netId);
-        if (info.has_value() && info->isRemote) {
-            spdlog::debug("ai_hooks: AI packages LOADED for remote entity {} "
-                           "(behavior tree valid, decisions overridden)",
-                           netId);
-        }
-    }
-
-    if (s_packageCount % 200 == 1) {
+    TrackRegisteredCharacter(character);
+    int packageCount = ++g_packageCount;
+    if (packageCount % 200 == 1) {
         spdlog::debug("ai_hooks: AIPackages #{} (char=0x{:X}, pkg=0x{:X})",
-                       s_packageCount, (uintptr_t)character, (uintptr_t)aiPackage);
+                      packageCount, reinterpret_cast<uintptr_t>(character),
+                      reinterpret_cast<uintptr_t>(aiPackage));
     }
 }
-
-// ── Install / Uninstall ──
 
 bool Install() {
     auto& funcs = Core::Get().GetGameFunctions();
     auto& hooks = HookManager::Get();
     int installed = 0;
 
-    if (funcs.AICreate) {
-        if (hooks.InstallAt("AICreate", reinterpret_cast<uintptr_t>(funcs.AICreate),
-                            &Hook_AICreate, &s_origAICreate)) {
-            installed++;
-            spdlog::info("ai_hooks: AICreate hook installed");
-        }
+    if (funcs.AICreate && hooks.InstallAt("AICreate", reinterpret_cast<uintptr_t>(funcs.AICreate),
+                                         &Hook_AICreate, &g_origAICreate)) {
+        installed++;
+        spdlog::info("ai_hooks: AICreate hook installed");
+    }
+    if (funcs.AIPackages && hooks.InstallAt("AIPackages", reinterpret_cast<uintptr_t>(funcs.AIPackages),
+                                           &Hook_AIPackages, &g_origAIPackages)) {
+        installed++;
+        spdlog::info("ai_hooks: AIPackages hook installed");
     }
 
-    if (funcs.AIPackages) {
-        if (hooks.InstallAt("AIPackages", reinterpret_cast<uintptr_t>(funcs.AIPackages),
-                            &Hook_AIPackages, &s_origAIPackages)) {
-            installed++;
-            spdlog::info("ai_hooks: AIPackages hook installed");
-        }
-    }
-
-    spdlog::info("ai_hooks: {}/2 hooks installed", installed);
+    spdlog::info("ai_hooks: {}/2 initialization hooks installed; AI decision suppression unavailable", installed);
     return installed > 0;
 }
 
 void Uninstall() {
     auto& hooks = HookManager::Get();
-    if (s_origAICreate)   hooks.Remove("AICreate");
-    if (s_origAIPackages) hooks.Remove("AIPackages");
-    s_origAICreate = nullptr;
-    s_origAIPackages = nullptr;
-
-    // Clear remote tracking
-    std::lock_guard lock(s_remoteMutex);
-    s_remoteControlled.clear();
+    if (g_origAICreate) {
+        hooks.Remove("AICreate");
+    }
+    if (g_origAIPackages) {
+        hooks.Remove("AIPackages");
+    }
+    g_origAICreate = nullptr;
+    g_origAIPackages = nullptr;
+    ClearRemoteControlled();
 }
 
 } // namespace kmp::ai_hooks

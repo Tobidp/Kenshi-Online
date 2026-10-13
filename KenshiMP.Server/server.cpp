@@ -1,5 +1,7 @@
 #include "server.h"
 #include "authority_validator.h"
+#include "kmp/ai_authority.h"
+#include "kmp/health_sync.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstdlib>
@@ -685,6 +687,17 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
 
     if (hostChanged) {
         BroadcastHostAssignment();
+    } else {
+        PacketWriter hostWriter;
+        hostWriter.WriteHeader(MessageType::S2C_HostAssignment);
+        MsgHostAssignment hostMsg{};
+        hostMsg.newHostPlayerId = m_hostPlayerId;
+        hostWriter.WriteRaw(&hostMsg, sizeof(hostMsg));
+        ENetPacket* hostPacket = enet_packet_create(
+            hostWriter.Data(), hostWriter.Size(), ENET_PACKET_FLAG_RELIABLE);
+        if (hostPacket && enet_peer_send(peer, KMP_CHANNEL_RELIABLE_ORDERED, hostPacket) < 0) {
+            enet_packet_destroy(hostPacket);
+        }
     }
 
     // Send faction assignment to the new player
@@ -822,19 +835,26 @@ void GameServer::HandlePositionUpdate(ConnectedPlayer& player, PacketReader& rea
         // === SERVER AUTHORITY VALIDATION (Phase 5) ===
         // Reject updates for entities the client doesn't own
         if (!ServerAuthorityValidator::ValidatePositionUpdate(
-                player.id, pos.entityId, pos.generation, m_entities)) {
+                player.id, pos.entityId, pos.generation, m_entities, m_hostPlayerId)) {
             continue; // Authority violation logged inside validator
         }
 
         // Update server-side entity position
         auto it = m_entities.find(pos.entityId);
         if (it != m_entities.end()) {
+            const uint32_t sequenceDelta = pos.inputSequence - it->second.lastInputSequence;
+            constexpr uint32_t SEQUENCE_HALF_RANGE = uint32_t(1) << 31;
+            if (it->second.lastInputSequence != 0 &&
+                (pos.inputSequence == 0 || sequenceDelta == 0 || sequenceDelta >= SEQUENCE_HALF_RANGE)) {
+                continue;
+            }
             it->second.position = Vec3(pos.posX, pos.posY, pos.posZ);
             it->second.rotation = Quat::Decompress(pos.compressedQuat);
             it->second.zone = ZoneCoord::FromWorldPos(it->second.position);
             it->second.animState = pos.animStateId;
             it->second.moveSpeed = pos.moveSpeed;
             it->second.flags = pos.flags;
+            it->second.lastInputSequence = pos.inputSequence;
 
             // Use the first owned entity's position for zone tracking
             if (!playerPosUpdated) {
@@ -851,7 +871,8 @@ void GameServer::HandleMoveCommand(ConnectedPlayer& player, PacketReader& reader
     if (!reader.ReadRaw(&msg, sizeof(msg))) return;
 
     // === SERVER AUTHORITY VALIDATION (Phase 5) ===
-    if (!ServerAuthorityValidator::CanClientCommandEntity(player.id, msg.entityId, m_entities)) {
+    if (!ServerAuthorityValidator::CanClientCommandEntity(
+            player.id, msg.entityId, m_entities, m_hostPlayerId)) {
         return; // Authority violation logged
     }
 
@@ -1059,7 +1080,7 @@ void GameServer::BroadcastPositions() {
             while (ownerEnd < entities.size() && entities[ownerEnd]->owner == sourcePlayer) {
                 ownerEnd++;
             }
-            if (sourcePlayer != playerId) {
+            {
                 for (size_t offset = firstEntity; offset < ownerEnd; offset += maxCount) {
                     batches.push_back({offset, std::min(maxCount, ownerEnd - offset)});
                 }
@@ -1086,6 +1107,7 @@ void GameServer::BroadcastPositions() {
                 CharacterPosition pos{};
                 pos.entityId = entity->id;
                 pos.generation = entity->generation;
+                pos.inputSequence = entity->lastInputSequence;
                 pos.posX = entity->position.x;
                 pos.posY = entity->position.y;
                 pos.posZ = entity->position.z;
@@ -1216,6 +1238,16 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
         return;
     }
 
+    const EntityType entityType = static_cast<EntityType>(type);
+    const bool worldNpc = IsWorldNpc(entityType, ownerId);
+    if (worldNpc && player.id != m_hostPlayerId) {
+        spdlog::warn("Rejected world NPC spawn from non-host player {}", player.id);
+        return;
+    }
+    if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) {
+        return;
+    }
+
     // Enforce global entity limit
     if (m_entities.size() >= KMP_MAX_SYNC_ENTITIES) {
         spdlog::warn("GameServer: Entity limit reached ({}) — rejecting spawn from '{}'",
@@ -1230,7 +1262,7 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
     ServerEntity entity;
     entity.id = serverId;
     entity.type = static_cast<EntityType>(type);
-    entity.owner = player.id;
+    entity.owner = worldNpc ? INVALID_PLAYER : player.id;
     entity.authority = entity.type == EntityType::PlayerCharacter
         ? AuthorityType::Player : AuthorityType::Server;
     entity.position = Vec3(px, py, pz);
@@ -1945,28 +1977,29 @@ void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
     auto it = m_entities.find(entityId);
     if (it == m_entities.end() || !it->second.alive) return;
 
-    // Cross-player combat: accept KO reports from entity owner or attacker owner
-    bool victimIsReporter = (it->second.owner == player.id);
-    bool attackerIsReporter = false;
-    if (attackerId != 0) {
-        auto attackerIt = m_entities.find(attackerId);
-        attackerIsReporter = (attackerIt != m_entities.end() && attackerIt->second.owner == player.id);
+    if (!CanSimulateActor(it->second.type, it->second.owner, player.id, m_hostPlayerId)) {
+        spdlog::warn("Rejected combat state from player {} for entity {}", player.id, it->second.id);
+        return;
     }
-    if (!victimIsReporter && !attackerIsReporter) return;
 
     spdlog::info("GameServer: Player '{}' reports entity {} KO (attacker={}, reason={}, health={:.1f})",
                  player.name, entityId, attackerId, reason, chestHealth);
 
+    if (!std::isfinite(chestHealth)) {
+        return;
+    }
+
     // Update server-side health — 'reason' is the KO cause (0=blood loss,
     // 1=head trauma, 2=other), NOT a body part index. The health value is
     // always chest health, so write to health[0] (chest).
-    it->second.health[0] = chestHealth;
+    it->second.health[static_cast<int>(BodyPart::Chest)] = chestHealth;
+    it->second.limbHealth[static_cast<int>(BodyPart::Chest)] = chestHealth;
 
     // Broadcast KO to ALL players (including reporter for consistency)
     MsgCombatKO koMsg{};
     koMsg.entityId = entityId;
     koMsg.attackerId = attackerId;
-    koMsg.bodyPart = reason;
+    koMsg.bodyPart = static_cast<uint8_t>(BodyPart::Chest);
     koMsg.resultHealth = chestHealth;
 
     PacketWriter writer;
@@ -1993,16 +2026,10 @@ void GameServer::HandleCombatDeath(ConnectedPlayer& player, PacketReader& reader
         return;
     }
 
-    // Cross-player combat: accept death reports from either the entity owner
-    // or the killer's owner. When player A kills player B's character, player A
-    // reports the death with killerId pointing to their own entity.
-    bool victimIsReporter = (it->second.owner == player.id);
-    bool killerIsReporter = false;
-    if (msg.killerId != 0) {
-        auto killerIt = m_entities.find(msg.killerId);
-        killerIsReporter = (killerIt != m_entities.end() && killerIt->second.owner == player.id);
+    if (!CanSimulateActor(it->second.type, it->second.owner, player.id, m_hostPlayerId)) {
+        spdlog::warn("Rejected combat state from player {} for entity {}", player.id, it->second.id);
+        return;
     }
-    if (!victimIsReporter && !killerIsReporter) return;
 
     // Mark entity as dead on the server so future attacks are rejected
     it->second.alive = false;
@@ -2022,22 +2049,22 @@ void GameServer::HandleCombatDeath(ConnectedPlayer& player, PacketReader& reader
 // ── Limb Health Handler ──
 
 void GameServer::HandleLimbHealth(ConnectedPlayer& player, PacketReader& reader) {
-    MsgLimbHealth msg;
-    if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-    // Validate entity ownership
-    auto it = m_entities.find(msg.entityId);
-    if (it == m_entities.end() || it->second.owner != player.id) return;
-
-    // Store limb health values on server entity
-    for (int i = 0; i < 7; i++) {
-        it->second.limbHealth[i] = msg.health[i];
+    MsgLimbHealth msg{};
+    if (!reader.ReadRaw(&msg, sizeof(msg)) || !IsFiniteLimbHealth(msg.health)) {
+        spdlog::warn("Rejected malformed health snapshot from player {}", player.id);
+        return;
     }
-
-    spdlog::debug("GameServer: Player '{}' limb health for entity {} (chest={:.1f})",
-                  player.name, msg.entityId, msg.health[static_cast<int>(BodyPart::Chest)]);
-
-    // Broadcast to other players
+    const auto it = m_entities.find(msg.entityId);
+    if (it == m_entities.end() || it->second.generation != msg.generation ||
+        !CanSimulateActor(it->second.type, it->second.owner, player.id, m_hostPlayerId)) {
+        spdlog::warn("Rejected health authority: player {} entity {} generation {}",
+                     player.id, msg.entityId, msg.generation);
+        return;
+    }
+    for (int limb = 0; limb < KMP_LIMB_COUNT; limb++) {
+        it->second.health[limb] = msg.health[limb];
+        it->second.limbHealth[limb] = msg.health[limb];
+    }
     PacketWriter writer;
     writer.WriteHeader(MessageType::S2C_LimbHealth);
     writer.WriteRaw(&msg, sizeof(msg));

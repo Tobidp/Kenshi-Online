@@ -7,6 +7,8 @@
 #include "net/client.h"
 #include "sync/entity_registry.h"
 #include "sync/interpolation.h"
+#include "sync/prediction_reconciliation.h"
+#include "sync/world_npc_sync.h"
 #include "game/game_types.h"
 #include "game/spawn_manager.h"
 #include "game/player_controller.h"
@@ -23,6 +25,8 @@
 #include "sdk/kenshi_sdk.h"
 #include "sdk/visual_proxy.h"
 #include "hooks/entity_hooks.h"
+#include "hooks/combat_hooks.h"
+#include "hooks/ai_hooks.h"
 #include "game_command_queue.h"
 #include <spdlog/spdlog.h>
 #include <atomic>
@@ -74,6 +78,11 @@ public:
     NetworkClient&    GetClient()          { return m_client; }
     EntityRegistry&   GetEntityRegistry()  { return m_entityRegistry; }
     Interpolation&    GetInterpolation()   { return m_interpolation; }
+    PredictionReconciliation& GetReconciliation() { return m_reconciliation; }
+    WorldNpcSync& GetWorldNpcSync() { return m_worldNpcSync; }
+
+    /// @brief Assigns a sequence and remembers a local player position before sending.
+    void TrackPredictedPosition(CharacterPosition& position);
     SpawnManager&        GetSpawnManager()       { return m_spawnManager; }
     PlayerController&    GetPlayerController()  { return m_playerController; }
     LoadingOrchestrator& GetLoadingOrch()       { return m_loadingOrch; }
@@ -83,8 +92,9 @@ public:
     ClientConfig&     GetConfig()          { return m_config; }
 
     bool IsConnected() const { return m_connected; }
-    bool IsHost() const { return m_isHost; }
-    PlayerID GetHostPlayerId() const { return m_hostPlayerId; }
+    uint64_t GetSessionEpoch() const { return m_sessionEpoch.load(); }
+    bool IsHost() const { return m_isHost.load(); }
+    PlayerID GetHostPlayerId() const { return m_hostPlayerId.load(); }
     bool IsSteamVersion() const { return m_isSteamVersion; }
     bool IsGameLoaded() const { return m_gameLoaded; }
     bool IsLoading() const { return m_clientPhase == ClientPhase::Loading; }
@@ -100,7 +110,9 @@ public:
     PlayerID GetLocalPlayerId() const { return m_localPlayerId.load(); }
 
     void SetConnected(bool connected) {
-        m_connected = connected;
+        if (m_connected.exchange(connected) != connected) {
+            m_sessionEpoch.fetch_add(1);
+        }
         if (connected) {
             // Phase transition handled by PacketHandler (TransitionTo(Connected))
             ResetKeepaliveTimer(); // Reset so first keepalive fires 5s after connect, not immediately
@@ -136,6 +148,10 @@ public:
             // Clean up remote entities, interpolation, and visual proxies
             size_t removed = m_entityRegistry.ClearRemoteEntities();
             m_interpolation.Clear();
+            m_reconciliation.Clear();
+            m_worldNpcSync.Reset();
+            combat_hooks::Reset();
+            ai_hooks::ClearRemoteControlled();
             m_visualProxy.DestroyAll();
             m_playerController.Reset();
             if (removed > 0) {
@@ -262,6 +278,7 @@ private:
     void ApplyRemotePositions();
     void ApplyRemotePositionsDirect(); // Direct interpolation → game character (no double-buffer)
     void PollLocalPositions();
+    void ApplyLocalReconciliation(float deltaTime);
     void SendCachedPackets();
     void HandleSpawnQueue();
     void HandleHostTeleport();
@@ -289,6 +306,9 @@ private:
     NetworkClient   m_client;
     EntityRegistry  m_entityRegistry;
     Interpolation   m_interpolation;
+    PredictionReconciliation m_reconciliation;
+    WorldNpcSync m_worldNpcSync;
+    std::atomic<uint32_t> m_nextInputSequence{1};
     SpawnManager       m_spawnManager;
     PlayerController   m_playerController;
     LoadingOrchestrator m_loadingOrch;
@@ -300,10 +320,11 @@ private:
     std::atomic<int>  m_lastCompletedStep{-1}; // Crash breadcrumb for SEH diagnostics
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_connected{false};
+    std::atomic<uint64_t> m_sessionEpoch{0};
     std::atomic<bool> m_gameLoaded{false};
     std::atomic<ClientPhase> m_clientPhase{ClientPhase::Startup};
-    bool              m_isHost = false;
-    PlayerID          m_hostPlayerId = 0;  // Server-authoritative host player id
+    std::atomic<bool> m_isHost{false};
+    std::atomic<PlayerID> m_hostPlayerId{0}; // Server-authoritative host player id
     bool              m_isSteamVersion = false;
     std::atomic<bool> m_timeHookActive{false};
     std::atomic<PlayerID> m_localPlayerId{0};
@@ -350,3 +371,4 @@ private:
 };
 
 } // namespace kmp
+
