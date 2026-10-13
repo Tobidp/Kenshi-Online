@@ -141,6 +141,7 @@ static void SendPositionUpdate() {
 
     CharacterPosition cp{};
     cp.entityId = g_myEntityId;
+    cp.generation = 0;
     cp.posX = g_posX;
     cp.posY = g_posY;
     cp.posZ = g_posZ;
@@ -148,7 +149,7 @@ static void SendPositionUpdate() {
     cp.animStateId = 1;  // walking
     cp.moveSpeed = 85;   // ~5 m/s
     cp.flags = 0x01;     // moving
-    w.WriteRaw(&cp, sizeof(cp));
+    WriteCharacterPosition(w, cp);
 
     SendUnreliable(w.Data(), w.Size());
 }
@@ -602,3 +603,4 @@ int main(int argc, char** argv) {
     printf("Test client exited.\n");
     return 0;
 }
+

@@ -10,12 +10,14 @@
 #include <enet/enet.h>
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <chrono>
 #include <thread>
 #include <vector>
+#include <unordered_set>
 #include <functional>
 #include <atomic>
 
@@ -47,6 +49,17 @@ static void TestAssert(bool condition, const char* testName) {
 // ─────────────────────────────────────────────────
 
 struct TestClient {
+    struct PositionSnapshot {
+        PlayerID sourcePlayer;
+        CharacterPosition position;
+    };
+
+    struct SpawnSnapshot {
+        EntityID entityId;
+        PlayerID owner;
+        Vec3 position;
+    };
+
     std::string name;
     ENetHost*   host = nullptr;
     ENetPeer*   peer = nullptr;
@@ -59,8 +72,11 @@ struct TestClient {
     std::vector<MsgPlayerJoined>  playersJoined;
     std::vector<MsgPlayerLeft>    playersLeft;
     std::vector<uint32_t>         entitiesSpawned;   // entity IDs
+    std::vector<SpawnSnapshot>    spawnSnapshots;
     std::vector<uint32_t>         entitiesDespawned; // entity IDs
     int                           posUpdatesReceived = 0;
+    std::vector<PositionSnapshot> positionSnapshots;
+    int                           positionParseFailures = 0;
     std::vector<std::string>      chatMessages;
     std::vector<std::string>      systemMessages;
     int                           timeSyncsReceived = 0;
@@ -101,6 +117,7 @@ struct TestClient {
     void SendUnreliable(const uint8_t* data, size_t len) {
         ENetPacket* pkt = enet_packet_create(data, len, ENET_PACKET_FLAG_UNSEQUENCED);
         enet_peer_send(peer, KMP_CHANNEL_UNRELIABLE_SEQ, pkt);
+        enet_host_flush(host);
     }
 
     void SendHandshake() {
@@ -117,10 +134,10 @@ struct TestClient {
         SendReliable(w.Data(), w.Size());
     }
 
-    void SendEntitySpawn(float x, float y, float z) {
+    void SendEntitySpawn(float x, float y, float z, EntityID clientEntityId = 1) {
         PacketWriter w;
         w.WriteHeader(MessageType::C2S_EntitySpawnReq);
-        w.WriteU32(1);  // client entity ID
+        w.WriteU32(clientEntityId);
         w.WriteU8(static_cast<uint8_t>(EntityType::PlayerCharacter));
         w.WriteU32(playerId);
         w.WriteU32(0);  // template ID
@@ -142,6 +159,7 @@ struct TestClient {
 
         CharacterPosition cp{};
         cp.entityId = entityId;
+        cp.generation = 0;
         cp.posX = x;
         cp.posY = y;
         cp.posZ = z;
@@ -149,9 +167,25 @@ struct TestClient {
         cp.animStateId = 1;
         cp.moveSpeed = 85;
         cp.flags = 0x01;
-        w.WriteRaw(&cp, sizeof(cp));
+        WriteCharacterPosition(w, cp);
 
         SendUnreliable(w.Data(), w.Size());
+    }
+
+    bool HasPositionSnapshot(PlayerID sourcePlayer, EntityID entityId, uint32_t generation,
+                             float x, float y, float z) const {
+        constexpr float POSITION_EPSILON = 0.001f;
+        for (auto snapshot = positionSnapshots.rbegin(); snapshot != positionSnapshots.rend();
+             ++snapshot) {
+            const auto& position = snapshot->position;
+            if (snapshot->sourcePlayer == sourcePlayer && position.entityId == entityId &&
+                position.generation == generation) {
+                return std::fabs(position.posX - x) < POSITION_EPSILON &&
+                       std::fabs(position.posY - y) < POSITION_EPSILON &&
+                       std::fabs(position.posZ - z) < POSITION_EPSILON;
+            }
+        }
+        return false;
     }
 
     void SendChat(const std::string& msg) {
@@ -274,20 +308,19 @@ struct TestClient {
             break;
         }
         case MessageType::S2C_EntitySpawn: {
-            uint32_t entId, ownerId, templateId, compQuat, factionId;
-            uint8_t type;
-            float px, py, pz;
-            r.ReadU32(entId);
-            r.ReadU8(type);
-            r.ReadU32(ownerId);
-            r.ReadU32(templateId);
-            r.ReadF32(px); r.ReadF32(py); r.ReadF32(pz);
-            r.ReadU32(compQuat);
-            r.ReadU32(factionId);
+            uint32_t entId{}, ownerId{}, templateId{}, compQuat{}, factionId{};
+            uint8_t type{};
+            float px{}, py{}, pz{};
             std::string tmplName;
-            r.ReadString(tmplName);
+            if (!r.ReadU32(entId) || !r.ReadU8(type) || !r.ReadU32(ownerId) ||
+                !r.ReadU32(templateId) || !r.ReadVec3(px, py, pz) || !r.ReadU32(compQuat) ||
+                !r.ReadU32(factionId) || !r.ReadString(tmplName)) {
+                printf("  [%s] Malformed entity spawn\n", name.c_str());
+                break;
+            }
 
             entitiesSpawned.push_back(entId);
+            spawnSnapshots.push_back({entId, ownerId, Vec3(px, py, pz)});
 
             // Track our own entity
             if (ownerId == playerId && myEntityId == 0) {
@@ -303,6 +336,33 @@ struct TestClient {
             break;
         }
         case MessageType::S2C_PositionUpdate: {
+            MsgS2CPositionUpdate update{};
+            if (!r.ReadRaw(&update, sizeof(update)) ||
+                r.Remaining() != static_cast<size_t>(update.characterCount) * sizeof(CharacterPosition)) {
+                positionParseFailures++;
+                printf("  [%s] Malformed position update: remaining=%zu bytes\n",
+                       name.c_str(), r.Remaining());
+                break;
+            }
+
+            std::vector<PositionSnapshot> decodedSnapshots;
+            decodedSnapshots.reserve(update.characterCount);
+            for (uint8_t index = 0; index < update.characterCount; index++) {
+                CharacterPosition position{};
+                if (!ReadCharacterPosition(r, position)) {
+                    positionParseFailures++;
+                    printf("  [%s] Truncated position record %u from player %u\n",
+                           name.c_str(), index, update.sourcePlayer);
+                    break;
+                }
+                decodedSnapshots.push_back({update.sourcePlayer, position});
+            }
+            if (decodedSnapshots.size() != update.characterCount) {
+                break;
+            }
+
+            positionSnapshots.insert(positionSnapshots.end(),
+                                     decodedSnapshots.begin(), decodedSnapshots.end());
             posUpdatesReceived++;
             break;
         }
@@ -760,39 +820,54 @@ static void Test_PositionSync() {
 
     TestAssert(client1.myEntityId != 0 && client2.myEntityId != 0,
                "Both clients have entities");
+    if (client1.myEntityId == 0 || client2.myEntityId == 0) {
+        client1.Disconnect();
+        client2.Disconnect();
+        client1.Destroy();
+        client2.Destroy();
+        return;
+    }
+
+    client1.positionSnapshots.clear();
+    client2.positionSnapshots.clear();
+    int c1ParseFailuresBefore = client1.positionParseFailures;
+    int c2ParseFailuresBefore = client2.positionParseFailures;
 
     // Client 1 sends several position updates
-    int c2PosBefore = client2.posUpdatesReceived;
     for (int i = 0; i < 5; i++) {
         float x = -51200.f + static_cast<float>(i) * 10.f;
         client1.SendPositionUpdate(client1.myEntityId, x, 1600.f, 2700.f);
         // Small delay to let server forward
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        client1.Poll(50);
         client2.Poll(50);
     }
 
-    // Give extra time for server forwarding
-    client2.Poll(500);
-
-    bool gotPosUpdates = (client2.posUpdatesReceived > c2PosBefore);
-    TestAssert(gotPosUpdates, "Client 2 received position updates from Client 1");
-    printf("    Position updates received by Client 2: %d (was %d)\n",
-           client2.posUpdatesReceived, c2PosBefore);
+    bool gotFinalPosition = client2.PollUntil([&]() {
+        return client2.HasPositionSnapshot(client1.playerId, client1.myEntityId, 0,
+                                           -51160.f, 1600.f, 2700.f);
+    }, 3000);
+    TestAssert(gotFinalPosition,
+               "Client 2 received Client 1's final position with its owner, entity and generation");
 
     // Client 2 sends position updates back
-    int c1PosBefore = client1.posUpdatesReceived;
     for (int i = 0; i < 5; i++) {
         float z = 2720.f + static_cast<float>(i) * 10.f;
         client2.SendPositionUpdate(client2.myEntityId, -51180.f, 1600.f, z);
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
         client1.Poll(50);
+        client2.Poll(50);
     }
-    client1.Poll(500);
 
-    bool gotReverse = (client1.posUpdatesReceived > c1PosBefore);
-    TestAssert(gotReverse, "Client 1 received position updates from Client 2");
-    printf("    Position updates received by Client 1: %d (was %d)\n",
-           client1.posUpdatesReceived, c1PosBefore);
+    bool gotReversePosition = client1.PollUntil([&]() {
+        return client1.HasPositionSnapshot(client2.playerId, client2.myEntityId, 0,
+                                           -51180.f, 1600.f, 2760.f);
+    }, 3000);
+    TestAssert(gotReversePosition,
+               "Client 1 received Client 2's final position with its owner, entity and generation");
+    TestAssert(client1.positionParseFailures == c1ParseFailuresBefore &&
+                   client2.positionParseFailures == c2ParseFailuresBefore,
+               "Both clients decoded complete position records without protocol errors");
 
     client1.Disconnect();
     client2.Disconnect();
@@ -1100,6 +1175,84 @@ static bool SetupTwoClients(TestClient& c1, TestClient& c2,
     return true;
 }
 
+static void TestPositionBroadcastBatching() {
+    printf("\n=== Test: Position Broadcast Batching ===\n");
+
+    TestClient owner, observer;
+    bool ready = SetupTwoClients(owner, observer, "BatchOwner", "BatchObserver");
+    TestAssert(ready, "Batching clients connected with entities");
+    if (!ready) {
+        CleanupTwoClients(owner, observer);
+        return;
+    }
+
+    // More than 255 entities from one owner must survive the uint8_t record count.
+    constexpr size_t ENTITY_COUNT = 260;
+    for (size_t index = 1; index < ENTITY_COUNT; index++) {
+        owner.SendEntitySpawn(-51200.f + static_cast<float>(index) * 2.f, 1600.f, 2700.f,
+                              static_cast<EntityID>(index + 1));
+        if (index % 16 == 0) {
+            owner.Poll(10);
+            observer.Poll(10);
+        }
+    }
+
+    auto countOwnerSpawns = [&]() {
+        std::unordered_set<EntityID> entityIds;
+        for (const auto& spawn : observer.spawnSnapshots) {
+            if (spawn.owner == owner.playerId) {
+                entityIds.insert(spawn.entityId);
+            }
+        }
+        return entityIds.size();
+    };
+
+    auto spawnDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (countOwnerSpawns() < ENTITY_COUNT && std::chrono::steady_clock::now() < spawnDeadline) {
+        owner.Poll(25);
+        observer.Poll(25);
+    }
+    bool gotAllSpawns = countOwnerSpawns() >= ENTITY_COUNT;
+    TestAssert(gotAllSpawns, "Observer received all 260 entities belonging to one owner");
+    if (!gotAllSpawns) {
+        CleanupTwoClients(owner, observer);
+        return;
+    }
+
+    owner.positionSnapshots.clear();
+    observer.positionSnapshots.clear();
+    int parseFailuresBefore = observer.positionParseFailures;
+    auto hasAllOwnerPositions = [&]() {
+        for (const auto& spawn : observer.spawnSnapshots) {
+            if (spawn.owner == owner.playerId &&
+                !observer.HasPositionSnapshot(owner.playerId, spawn.entityId, 0,
+                                              spawn.position.x, spawn.position.y, spawn.position.z)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto positionDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!hasAllOwnerPositions() && std::chrono::steady_clock::now() < positionDeadline) {
+        owner.Poll(25);
+        observer.Poll(25);
+    }
+
+    TestAssert(hasAllOwnerPositions(),
+               "Every entity receives an owner-attributed position across broadcast batches");
+    bool receivedOtherOwner = owner.PollUntil([&]() {
+        return owner.HasPositionSnapshot(observer.playerId, observer.myEntityId, 0,
+                                         -51180.f, 1600.f, 2720.f);
+    }, 3000);
+    TestAssert(receivedOtherOwner,
+               "Broadcast batches preserve the second player's distinct ownership");
+    TestAssert(observer.positionParseFailures == parseFailuresBefore,
+               "Large broadcasts decode without truncated or surplus records");
+
+    CleanupTwoClients(owner, observer);
+}
+
 static void Test_InventorySync() {
     printf("\n=== Test: Inventory Sync ===\n");
 
@@ -1381,16 +1534,19 @@ static void Test_FullMultiplayerSession() {
     printf("    Host entity: %u, Joiner entity: %u\n", c1.myEntityId, c2.myEntityId);
 
     // Step 1: Position updates (can they see each other?)
-    int c2PosBefore = c2.posUpdatesReceived;
+    c2.positionSnapshots.clear();
     for (int i = 0; i < 3; i++) {
         c1.SendPositionUpdate(c1.myEntityId,
             -51200.f + i * 5.f, 1600.f, 2700.f);
         std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        c1.Poll(50);
         c2.Poll(50);
     }
-    c2.Poll(500);
-    bool seesEachOther = (c2.posUpdatesReceived > c2PosBefore);
-    TestAssert(seesEachOther, "Full session: players can see each other's movement");
+    bool receivedMovement = c2.PollUntil([&]() {
+        return c2.HasPositionSnapshot(c1.playerId, c1.myEntityId, 0,
+                                      -51190.f, 1600.f, 2700.f);
+    }, 3000);
+    TestAssert(receivedMovement, "Full session: remote client received the host's final position");
 
     // Step 2: Building placement
     c1.SendBuildRequest(9001, -51200.f, 1600.f, 2705.f);
@@ -1530,6 +1686,9 @@ int main(int argc, char** argv) {
     Test_PositionSync();
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
+    TestPositionBroadcastBatching();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
     Test_ChatRelay();
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
@@ -1586,3 +1745,4 @@ int main(int argc, char** argv) {
 
     return g_testsFailed > 0 ? 1 : 0;
 }
+

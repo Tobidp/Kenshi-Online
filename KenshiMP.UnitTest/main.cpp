@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  KenshiMP Unit Test — Validates game-facing logic with fake game memory
 // ═══════════════════════════════════════════════════════════════════════════
-// This test proves the EXACT code that runs inside Kenshi actually works:
+// These tests exercise production implementations against controlled inputs:
 //   - CharacterAccessor reads/writes positions, names, factions correctly
 //   - EntityRegistry tracks entities by ID, owner, game object pointer
 //   - Interpolation system smooths remote player movement
@@ -10,11 +10,14 @@
 // We allocate fake "game objects" in our own process memory. The Memory::Read/Write
 // functions use raw pointer dereference (with SEH), so they work identically
 // on our fake buffers as they do on real Kenshi game objects.
-// If this test passes, the in-game code WILL work (assuming correct offsets).
+// Passing these tests validates the controlled inputs; game offsets, hooks, and
+// real multiplayer behavior still require validation inside Kenshi.
 
 #include "game/game_types.h"
+#include "sync/authority_validator.h"
 #include "sync/entity_registry.h"
 #include "sync/interpolation.h"
+#include "../KenshiMP.Server/authority_validator.h"
 #include "kmp/types.h"
 #include "kmp/constants.h"
 #include "kmp/protocol.h"
@@ -27,6 +30,7 @@
 #include <cstdlib>
 #include <vector>
 #include <string>
+#include <unordered_map>
 
 // ── Test framework ──
 static int g_passed = 0;
@@ -387,18 +391,23 @@ static void Test_PacketRoundTrip() {
     kmp::PacketWriter writer;
     writer.WriteHeader(kmp::MessageType::C2S_PositionUpdate);
 
-    kmp::MsgC2SPositionUpdate header_msg{};
-    header_msg.characterCount = 1;
-    writer.WriteRaw(&header_msg, sizeof(header_msg));
+    writer.WriteU8(1);
 
     kmp::CharacterPosition charPos{};
     charPos.entityId = 42;
+    charPos.generation = 7;
     charPos.posX = -51200.0f;
     charPos.posY = 1600.0f;
     charPos.posZ = 2700.0f;
     charPos.moveSpeed = 128; // ~7.5 m/s
     charPos.animStateId = 1; // walking
-    writer.WriteRaw(&charPos, sizeof(charPos));
+    charPos.compressedQuat = kmp::Quat().Compress();
+    charPos.flags = 0x0102;
+    kmp::WriteCharacterPosition(writer, charPos);
+
+    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 28;
+    TestAssert(writer.Size() == sizeof(kmp::PacketHeader) + 1 + CHARACTER_POSITION_WIRE_SIZE,
+               "Production serializer writes a 28-byte position record");
 
     // Read it back (simulating server receiving the packet)
     kmp::PacketReader reader(writer.Data(), writer.Size());
@@ -413,13 +422,83 @@ static void Test_PacketRoundTrip() {
     kmp::CharacterPosition readPos{};
     TestAssert(reader.ReadRaw(&readPos, sizeof(readPos)), "Reader reads character position");
     TestAssert(readPos.entityId == 42, "Entity ID matches");
+    TestAssert(readPos.generation == 7, "Generation follows entity ID on the wire");
     TestAssert(FloatEq(readPos.posX, -51200.0f), "Position.x matches");
     TestAssert(FloatEq(readPos.posY, 1600.0f),   "Position.y matches");
     TestAssert(FloatEq(readPos.posZ, 2700.0f),   "Position.z matches");
     TestAssert(readPos.moveSpeed == 128, "MoveSpeed matches");
     TestAssert(readPos.animStateId == 1, "AnimState matches");
+    TestAssert(readPos.compressedQuat == charPos.compressedQuat, "Compressed rotation matches");
+    TestAssert(readPos.flags == charPos.flags, "Flags match");
+    TestAssert(reader.Remaining() == 0, "Position packet has no unread bytes");
+
+    // The old client layout omitted generation and produced a 24-byte record.
+    constexpr size_t LEGACY_POSITION_WIRE_SIZE = 24;
+    kmp::PacketReader truncatedReader(writer.Data() + sizeof(kmp::PacketHeader) + 1,
+                                     LEGACY_POSITION_WIRE_SIZE);
+    kmp::CharacterPosition truncatedPos{};
+    TestAssert(!truncatedReader.ReadRaw(&truncatedPos, sizeof(truncatedPos)),
+               "Server record reader rejects the old 24-byte position layout");
     printf("    Position update packet: entity=%u pos=(%.1f, %.1f, %.1f)\n",
            readPos.entityId, readPos.posX, readPos.posY, readPos.posZ);
+}
+
+static void TestPositionRecordReader() {
+    printf("\n=== Test: Production Position Record Reader ===\n");
+
+    kmp::CharacterPosition firstPosition{};
+    firstPosition.entityId = 100;
+    firstPosition.generation = 7;
+    firstPosition.posX = -51200.f;
+    firstPosition.posY = 1600.f;
+    firstPosition.posZ = 2700.f;
+    firstPosition.compressedQuat = 0x12345678;
+    firstPosition.animStateId = 1;
+    firstPosition.moveSpeed = 85;
+    firstPosition.flags = 0x0102;
+
+    kmp::CharacterPosition secondPosition = firstPosition;
+    secondPosition.entityId = 101;
+    secondPosition.generation = 8;
+    secondPosition.posZ = 2760.f;
+
+    kmp::PacketWriter writer;
+    kmp::WriteCharacterPosition(writer, firstPosition);
+    kmp::WriteCharacterPosition(writer, secondPosition);
+
+    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 28;
+    TestAssert(writer.Size() == 2 * CHARACTER_POSITION_WIRE_SIZE,
+               "Two production position records occupy exactly 56 bytes");
+
+    kmp::PacketReader reader(writer.Data(), writer.Size());
+    kmp::CharacterPosition decodedPosition{};
+    TestAssert(kmp::ReadCharacterPosition(reader, decodedPosition),
+               "Production reader decodes the first position");
+    TestAssert(decodedPosition.entityId == firstPosition.entityId &&
+                   decodedPosition.generation == firstPosition.generation &&
+                   FloatEq(decodedPosition.posX, firstPosition.posX) &&
+                   FloatEq(decodedPosition.posY, firstPosition.posY) &&
+                   FloatEq(decodedPosition.posZ, firstPosition.posZ) &&
+                   decodedPosition.compressedQuat == firstPosition.compressedQuat &&
+                   decodedPosition.animStateId == firstPosition.animStateId &&
+                   decodedPosition.moveSpeed == firstPosition.moveSpeed &&
+                   decodedPosition.flags == firstPosition.flags,
+               "Production reader preserves every first-record field");
+    TestAssert(kmp::ReadCharacterPosition(reader, decodedPosition),
+               "Production reader decodes the second position without losing alignment");
+    TestAssert(decodedPosition.entityId == secondPosition.entityId &&
+                   decodedPosition.generation == secondPosition.generation &&
+                   FloatEq(decodedPosition.posZ, secondPosition.posZ) && reader.Remaining() == 0,
+               "Second entity and generation remain aligned on the wire");
+
+    kmp::PacketReader truncatedReader(writer.Data(), CHARACTER_POSITION_WIRE_SIZE - 1);
+    decodedPosition = secondPosition;
+    TestAssert(!kmp::ReadCharacterPosition(truncatedReader, decodedPosition),
+               "Production reader rejects a truncated record");
+    TestAssert(truncatedReader.Position() == 0 &&
+                   decodedPosition.entityId == secondPosition.entityId &&
+                   decodedPosition.generation == secondPosition.generation,
+               "Rejected truncated record leaves the reader and output intact");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -638,6 +717,121 @@ static void TestHostAssignmentProtocol() {
     TestAssert(copy.newHostPlayerId == 42, "MsgHostAssignment round-trips through byte buffer");
 }
 
+static void TestServerAuthorityValidation() {
+    printf("\n=== Test: Server Position Authority ===\n");
+
+    constexpr kmp::PlayerID OWNER_PLAYER_ID = 2;
+    constexpr kmp::PlayerID OTHER_PLAYER_ID = 3;
+    constexpr kmp::EntityID ENTITY_ID = 100;
+    constexpr uint32_t GENERATION = 7;
+
+    kmp::ServerEntity entity;
+    entity.id = ENTITY_ID;
+    entity.owner = OWNER_PLAYER_ID;
+    entity.generation = GENERATION;
+    entity.authority = kmp::AuthorityType::Player;
+    std::unordered_map<kmp::EntityID, kmp::ServerEntity> entities;
+    entities.emplace(ENTITY_ID, entity);
+
+    TestAssert(kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION, entities),
+               "Server accepts the owner's current-generation position");
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OTHER_PLAYER_ID, ENTITY_ID, GENERATION, entities),
+               "Server rejects another player's position command");
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION - 1, entities),
+               "Server rejects a stale generation");
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION + 1, entities),
+               "Server rejects a future generation");
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID + 1, GENERATION, entities),
+               "Server rejects an unknown entity");
+
+    auto& storedEntity = entities.at(ENTITY_ID);
+    storedEntity.alive = false;
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION, entities),
+               "Server rejects a dead entity");
+
+    storedEntity.alive = true;
+    storedEntity.authority = kmp::AuthorityType::Server;
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION, entities),
+               "Server rejects player commands for server authority");
+
+    storedEntity.authority = kmp::AuthorityType::Transferring;
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(
+                   OWNER_PLAYER_ID, ENTITY_ID, GENERATION, entities),
+               "Server rejects commands during authority transfer");
+}
+
+static void TestClientAuthorityValidation() {
+    printf("\n=== Test: Client Position Authority ===\n");
+
+    constexpr kmp::PlayerID LOCAL_PLAYER_ID = 1;
+    constexpr kmp::PlayerID REMOTE_PLAYER_ID = 2;
+    constexpr kmp::EntityID REMOTE_ENTITY_ID = 100;
+    constexpr kmp::EntityID SERVER_ENTITY_ID = 101;
+
+    kmp::EntityRegistry registry;
+    FakeCharacter localCharacter;
+    kmp::EntityID localEntityId = registry.Register(
+        localCharacter.Ptr(), kmp::EntityType::PlayerCharacter, LOCAL_PLAYER_ID);
+    registry.RegisterRemote(REMOTE_ENTITY_ID, kmp::EntityType::PlayerCharacter,
+                            REMOTE_PLAYER_ID, kmp::Vec3{});
+    registry.RegisterRemote(SERVER_ENTITY_ID, kmp::EntityType::NPC, 0, kmp::Vec3{});
+
+    kmp::CharacterPosition position{};
+    position.entityId = REMOTE_ENTITY_ID;
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, REMOTE_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::ApplyRemote,
+               "Client applies a remote snapshot attributed to its owner");
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, 0, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::RejectAuthorityViolation,
+               "Client rejects a player entity incorrectly attributed to the server");
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, LOCAL_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::RejectAuthorityViolation,
+               "Client rejects a remote snapshot from the wrong owner");
+
+    position.generation = 1;
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, REMOTE_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::RejectStaleGeneration,
+               "Client rejects a remote generation mismatch");
+
+    position.generation = 0;
+    position.entityId = localEntityId;
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, LOCAL_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::ReconcileLocal,
+               "Client reconciles a local snapshot attributed to its owner");
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, REMOTE_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::RejectAuthorityViolation,
+               "Client rejects a forged local snapshot before reconciliation");
+
+    position.entityId = SERVER_ENTITY_ID;
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, 0, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::ApplyRemote,
+               "Client applies a server-owned NPC snapshot from the server");
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, REMOTE_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::RejectAuthorityViolation,
+               "Client rejects a player's snapshot for a server-owned NPC");
+
+    position.entityId = SERVER_ENTITY_ID + 1;
+    TestAssert(kmp::AuthorityValidator::ValidateInboundSnapshot(
+                   position, REMOTE_PLAYER_ID, LOCAL_PLAYER_ID, registry) ==
+                   kmp::SnapshotDecision::QueuePendingSpawn,
+               "Client queues an unknown entity until its spawn arrives");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Loopback detection test
 // ═══════════════════════════════════════════════════════════════════════════
@@ -686,10 +880,13 @@ int main() {
     Test_EntityRemap();
     Test_Interpolation();
     Test_PacketRoundTrip();
+    TestPositionRecordReader();
     Test_SpawnPacketRoundTrip();
     Test_FullSpawnFlow();
     Test_MultiPlayerSession();
     TestHostAssignmentProtocol();
+    TestServerAuthorityValidation();
+    TestClientAuthorityValidation();
     TestLoopbackDetection();
 
     printf("\n======================================\n");
@@ -704,3 +901,4 @@ int main() {
 
     return g_failed > 0 ? 1 : 0;
 }
+

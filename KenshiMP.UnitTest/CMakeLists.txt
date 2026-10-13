@@ -6,7 +6,9 @@ add_executable(KenshiMP.UnitTest
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/game/game_character.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/game/game_offset_prober.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/entity_registry.cpp
+    ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/authority_validator.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/interpolation.cpp
+    ${CMAKE_SOURCE_DIR}/KenshiMP.Server/authority_validator.cpp
 )
 
 target_include_directories(KenshiMP.UnitTest PRIVATE
@@ -19,5 +21,7 @@ target_include_directories(KenshiMP.UnitTest PRIVATE
 target_link_libraries(KenshiMP.UnitTest PRIVATE
     KenshiMP.Common
     KenshiMP.Scanner
+    enet
     spdlog::spdlog
 )
+
