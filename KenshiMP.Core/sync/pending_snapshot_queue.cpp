@@ -1,6 +1,7 @@
 #include "pending_snapshot_queue.h"
 #include "../core.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 
 namespace kmp {
 
@@ -81,3 +82,4 @@ void PendingSnapshotQueue::CleanupOld(float currentTime, float maxAge) {
 }
 
 } // namespace kmp
+

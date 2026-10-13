@@ -1,6 +1,7 @@
 add_executable(KenshiMP.Server
     main.cpp
     server.cpp
+    authority_validator.cpp
     upnp.cpp
     game_state.cpp
     player_manager.cpp
@@ -33,3 +34,4 @@ if(EXISTS "${KENSHI_DIR}/kenshi_x64.exe")
         COMMENT "Copying KenshiMP.Server.exe to Kenshi directory"
     )
 endif()
+

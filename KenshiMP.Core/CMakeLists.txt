@@ -52,6 +52,9 @@ add_library(KenshiMP.Core SHARED
     sync/sync_orchestrator.cpp
     sync/pipeline_orchestrator.cpp
     sync/sync_facilitator.cpp
+    sync/authority_validator.cpp
+    sync/pending_snapshot_queue.cpp
+    sync/deferred_spawn_queue.cpp
     # SDK (polling-based game state + visual proxy)
     sdk/kenshi_sdk.cpp
     sdk/visual_proxy.cpp
@@ -108,3 +111,4 @@ if(EXISTS "${KENSHI_DIR}/kenshi_x64.exe")
         endif()
     endforeach()
 endif()
+
