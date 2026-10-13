@@ -7,9 +7,12 @@
 #include <kmp/messages.h>
 #include <kmp/constants.h>
 #include <kmp/types.h>
+#include <kmp/health_sync.h>
 #include <enet/enet.h>
 
 #include <cstdio>
+#include <algorithm>
+#include <limits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +70,7 @@ struct TestClient {
     bool        connected = false;
     bool        handshakeOk = false;
     EntityID    myEntityId = 0;
+    uint32_t m_nextInputSequence = 1;
 
     // Received data tracking
     std::vector<MsgPlayerJoined>  playersJoined;
@@ -76,6 +80,7 @@ struct TestClient {
     std::vector<uint32_t>         entitiesDespawned; // entity IDs
     int                           posUpdatesReceived = 0;
     std::vector<PositionSnapshot> positionSnapshots;
+    std::vector<MsgLimbHealth> m_healthSnapshots;
     int                           positionParseFailures = 0;
     std::vector<std::string>      chatMessages;
     std::vector<std::string>      systemMessages;
@@ -160,6 +165,7 @@ struct TestClient {
         CharacterPosition cp{};
         cp.entityId = entityId;
         cp.generation = 0;
+        cp.inputSequence = m_nextInputSequence++;
         cp.posX = x;
         cp.posY = y;
         cp.posZ = z;
@@ -187,6 +193,19 @@ struct TestClient {
         }
         return false;
     }
+
+    void SendLimbHealth(EntityID entityId, uint32_t generation, const float health[KMP_LIMB_COUNT]) {
+        MsgLimbHealth snapshot{};
+        snapshot.entityId = entityId;
+        snapshot.generation = generation;
+        std::copy(health, health + KMP_LIMB_COUNT, snapshot.health);
+        PacketWriter writer;
+        writer.WriteHeader(MessageType::C2S_LimbHealth);
+        writer.WriteRaw(&snapshot, sizeof(snapshot));
+        SendReliable(writer.Data(), writer.Size());
+        enet_host_flush(host);
+    }
+
 
     void SendChat(const std::string& msg) {
         PacketWriter w;
@@ -364,6 +383,13 @@ struct TestClient {
             positionSnapshots.insert(positionSnapshots.end(),
                                      decodedSnapshots.begin(), decodedSnapshots.end());
             posUpdatesReceived++;
+            break;
+        }
+        case MessageType::S2C_LimbHealth: {
+            MsgLimbHealth snapshot{};
+            if (r.ReadRaw(&snapshot, sizeof(snapshot)) && IsFiniteLimbHealth(snapshot.health)) {
+                m_healthSnapshots.push_back(snapshot);
+            }
             break;
         }
         case MessageType::S2C_ChatMessage: {
@@ -1175,6 +1201,68 @@ static bool SetupTwoClients(TestClient& c1, TestClient& c2,
     return true;
 }
 
+static void TestHealthSnapshotAuthority() {
+    TestClient owner;
+    TestClient observer;
+    const bool initialized = owner.Init("HealthOwner") && observer.Init("HealthObserver");
+    const bool ownerConnected = initialized && owner.Connect("127.0.0.1", KMP_DEFAULT_PORT) &&
+        owner.PollUntil([&]() { return owner.connected; }, 3000);
+    const bool observerConnected = initialized && observer.Connect("127.0.0.1", KMP_DEFAULT_PORT) &&
+        observer.PollUntil([&]() { return observer.connected; }, 3000);
+    if (!ownerConnected || !observerConnected) {
+        TestAssert(false, "Health clients connect before sending reliable snapshots");
+        owner.Destroy();
+        observer.Destroy();
+        return;
+    }
+    owner.SendHandshake();
+    owner.PollUntil([&]() { return owner.handshakeOk; }, 3000);
+    observer.SendHandshake();
+    observer.PollUntil([&]() { return observer.handshakeOk; }, 3000);
+    owner.SendEntitySpawn(-51200.f, 1600.f, 2700.f);
+    owner.PollUntil([&]() { return owner.myEntityId != 0; }, 3000);
+    TestAssert(owner.handshakeOk && observer.handshakeOk && owner.myEntityId != 0,
+               "Health test has a registered owner and connected observer");
+    if (!owner.handshakeOk || !observer.handshakeOk || owner.myEntityId == 0) {
+        owner.Disconnect();
+        observer.Disconnect();
+        owner.Destroy();
+        observer.Destroy();
+        return;
+    }
+    const float health[KMP_LIMB_COUNT] = {75.f, 40.f, -20.f, 60.f, 55.f, 80.f, 90.f};
+    owner.SendLimbHealth(owner.myEntityId, 0, health);
+    const bool received = observer.PollUntil([&]() {
+        return std::any_of(observer.m_healthSnapshots.begin(), observer.m_healthSnapshots.end(),
+            [&](const MsgLimbHealth& snapshot) {
+                return snapshot.entityId == owner.myEntityId && snapshot.generation == 0 &&
+                       std::equal(health, health + KMP_LIMB_COUNT, snapshot.health);
+            });
+    }, 3000);
+    TestAssert(received, "Owner limb health is relayed with exact values, including legitimate negative health");
+    const size_t before = observer.m_healthSnapshots.size();
+    const size_t ownerBefore = owner.m_healthSnapshots.size();
+    observer.SendLimbHealth(owner.myEntityId, 0, health);
+    owner.Poll(200);
+    observer.Poll(200);
+    TestAssert(observer.m_healthSnapshots.size() == before && owner.m_healthSnapshots.size() == ownerBefore,
+               "Another player cannot forge owner limb health");
+    owner.SendLimbHealth(owner.myEntityId, 1, health);
+    observer.Poll(300);
+    TestAssert(observer.m_healthSnapshots.size() == before, "Stale health generation is rejected");
+    float invalid[KMP_LIMB_COUNT];
+    std::copy(health, health + KMP_LIMB_COUNT, invalid);
+    invalid[0] = std::numeric_limits<float>::quiet_NaN();
+    owner.SendLimbHealth(owner.myEntityId, 0, invalid);
+    observer.Poll(300);
+    TestAssert(observer.m_healthSnapshots.size() == before, "Non-finite limb health is rejected");
+    owner.Disconnect();
+    observer.Disconnect();
+    owner.Destroy();
+    observer.Destroy();
+}
+
+
 static void TestPositionBroadcastBatching() {
     printf("\n=== Test: Position Broadcast Batching ===\n");
 
@@ -1687,6 +1775,8 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     TestPositionBroadcastBatching();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    TestHealthSnapshotAuthority();
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     Test_ChatRelay();

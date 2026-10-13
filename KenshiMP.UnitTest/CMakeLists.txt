@@ -1,5 +1,7 @@
 add_executable(KenshiMP.UnitTest
     main.cpp
+    health_sync_tests.cpp
+    prediction_reconciliation_tests.cpp
 
     # Compile game-facing source files directly into the test.
     # These are the SAME files that run inside Kenshi via KenshiMP.Core.dll.
@@ -7,6 +9,7 @@ add_executable(KenshiMP.UnitTest
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/game/game_offset_prober.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/entity_registry.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/authority_validator.cpp
+    ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/prediction_reconciliation.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Core/sync/interpolation.cpp
     ${CMAKE_SOURCE_DIR}/KenshiMP.Server/authority_validator.cpp
 )

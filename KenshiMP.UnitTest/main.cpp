@@ -14,6 +14,9 @@
 // real multiplayer behavior still require validation inside Kenshi.
 
 #include "game/game_types.h"
+#include "health_sync_tests.h"
+#include "prediction_reconciliation_tests.h"
+#include "kmp/ai_authority.h"
 #include "sync/authority_validator.h"
 #include "sync/entity_registry.h"
 #include "sync/interpolation.h"
@@ -396,6 +399,7 @@ static void Test_PacketRoundTrip() {
     kmp::CharacterPosition charPos{};
     charPos.entityId = 42;
     charPos.generation = 7;
+    charPos.inputSequence = 9;
     charPos.posX = -51200.0f;
     charPos.posY = 1600.0f;
     charPos.posZ = 2700.0f;
@@ -405,9 +409,9 @@ static void Test_PacketRoundTrip() {
     charPos.flags = 0x0102;
     kmp::WriteCharacterPosition(writer, charPos);
 
-    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 28;
+    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 32;
     TestAssert(writer.Size() == sizeof(kmp::PacketHeader) + 1 + CHARACTER_POSITION_WIRE_SIZE,
-               "Production serializer writes a 28-byte position record");
+               "Production serializer writes a 32-byte acknowledged position record");
 
     // Read it back (simulating server receiving the packet)
     kmp::PacketReader reader(writer.Data(), writer.Size());
@@ -423,6 +427,7 @@ static void Test_PacketRoundTrip() {
     TestAssert(reader.ReadRaw(&readPos, sizeof(readPos)), "Reader reads character position");
     TestAssert(readPos.entityId == 42, "Entity ID matches");
     TestAssert(readPos.generation == 7, "Generation follows entity ID on the wire");
+    TestAssert(readPos.inputSequence == 9, "Input sequence follows the generation on the wire");
     TestAssert(FloatEq(readPos.posX, -51200.0f), "Position.x matches");
     TestAssert(FloatEq(readPos.posY, 1600.0f),   "Position.y matches");
     TestAssert(FloatEq(readPos.posZ, 2700.0f),   "Position.z matches");
@@ -466,7 +471,7 @@ static void TestPositionRecordReader() {
     kmp::WriteCharacterPosition(writer, firstPosition);
     kmp::WriteCharacterPosition(writer, secondPosition);
 
-    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 28;
+    constexpr size_t CHARACTER_POSITION_WIRE_SIZE = 32;
     TestAssert(writer.Size() == 2 * CHARACTER_POSITION_WIRE_SIZE,
                "Two production position records occupy exactly 56 bytes");
 
@@ -864,6 +869,35 @@ static void TestLoopbackDetection() {
 // ═══════════════════════════════════════════════════════════════════════════
 //  MAIN
 // ═══════════════════════════════════════════════════════════════════════════
+static void TestWorldNpcAuthority() {
+    constexpr kmp::PlayerID HOST_ID = 1;
+    constexpr kmp::PlayerID CLIENT_ID = 2;
+    TestAssert(kmp::CanPublishWorldNpc(kmp::EntityType::NPC, 0, HOST_ID, HOST_ID),
+               "Only the current host can publish a server-owned world NPC");
+    TestAssert(!kmp::CanPublishWorldNpc(kmp::EntityType::NPC, 0, CLIENT_ID, HOST_ID),
+               "A joining client cannot become a second world NPC simulator");
+    TestAssert(!kmp::CanPublishWorldNpc(kmp::EntityType::NPC, 0, HOST_ID, CLIENT_ID),
+               "The old host loses NPC simulation authority after migration");
+    TestAssert(!kmp::CanPublishWorldNpc(kmp::EntityType::NPC, 0, 0, 0),
+               "A missing host cannot authorize NPC publication");
+    TestAssert(kmp::CanSimulateActor(kmp::EntityType::PlayerCharacter, CLIENT_ID, CLIENT_ID, HOST_ID),
+               "Player characters remain controlled by their own player");
+    TestAssert(!kmp::CanSimulateActor(kmp::EntityType::PlayerCharacter, CLIENT_ID, HOST_ID, HOST_ID),
+               "Host identity does not grant control of another player's character");
+    std::unordered_map<kmp::EntityID, kmp::ServerEntity> entities;
+    kmp::ServerEntity npc{};
+    npc.id = 700;
+    npc.owner = 0;
+    npc.type = kmp::EntityType::NPC;
+    npc.authority = kmp::AuthorityType::Server;
+    entities.emplace(npc.id, npc);
+    TestAssert(kmp::ServerAuthorityValidator::ValidatePositionUpdate(HOST_ID, npc.id, 0, entities, HOST_ID),
+               "Production validator accepts the elected host's world NPC position");
+    TestAssert(!kmp::ServerAuthorityValidator::ValidatePositionUpdate(CLIENT_ID, npc.id, 0, entities, HOST_ID),
+               "Production validator rejects world NPC input from a joining client");
+}
+
+
 int main() {
     printf("======================================\n");
     printf("  KenshiMP Unit Test Suite\n");
@@ -887,6 +921,9 @@ int main() {
     TestHostAssignmentProtocol();
     TestServerAuthorityValidation();
     TestClientAuthorityValidation();
+    TestWorldNpcAuthority();
+    kmp::RunHealthSyncTests(TestAssert);
+    kmp::RunPredictionReconciliationTests(TestAssert);
     TestLoopbackDetection();
 
     printf("\n======================================\n");

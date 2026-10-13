@@ -33,6 +33,7 @@ static ENetPeer*   g_peer   = nullptr;
 static PlayerID    g_myId   = 0;
 static bool        g_connected = false;
 static uint32_t    g_myEntityId = 0;
+static uint32_t g_nextInputSequence = 1;
 static std::string g_playerName; // Set in main()
 
 // Position: start near Kenshi's "The Hub" area
@@ -142,6 +143,7 @@ static void SendPositionUpdate() {
     CharacterPosition cp{};
     cp.entityId = g_myEntityId;
     cp.generation = 0;
+    cp.inputSequence = g_nextInputSequence++;
     cp.posX = g_posX;
     cp.posY = g_posY;
     cp.posZ = g_posZ;
