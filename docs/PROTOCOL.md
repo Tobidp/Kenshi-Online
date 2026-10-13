@@ -1,7 +1,7 @@
 # Kenshi-Online Network Protocol Specification
 
-**Version:** 1  
-**Last Updated:** 2026-06-04  
+**Version:** 2  
+**Last Updated:** 2026-10-13  
 **Authors:** KenshiMP Development Team
 
 ---
@@ -29,8 +29,20 @@ Kenshi-Online uses a client-server architecture with authoritative server design
 - **Zone-based interest management** (3×3 grid, 750m zones)
 - **Entity generation counters** to prevent ghost control bugs
 
-**Protocol Version:** `1`  
+**Protocol Version:** `2`  
 **Default Port:** `27800`
+
+Protocol 2 requires rebuilding both client and server. Position records are 28 bytes,
+including generation immediately after entityId, and use the shared WriteCharacterPosition
+and ReadCharacterPosition helpers. Protocol-1 peers are rejected during the handshake.
+
+Every server position packet groups entities by owner; sourcePlayer is that owner, not
+the server connection ID. Server-owned entities use sourcePlayer=0. Batches fit the peer
+MTU and the 255-record count limit. Batch order rotates each tick because channel 2 can
+discard earlier packets after reordering. In-game and 16-player validation remain pending.
+
+Position updates now check generation on both endpoints. Generation allocation/reuse,
+spawn/despawn propagation, and persistence still need a complete lifecycle implementation.
 
 ---
 
@@ -237,7 +249,7 @@ struct PacketHeader {
 #### MsgHandshake (C2S_Handshake)
 ```cpp
 struct MsgHandshake {
-    uint32_t protocolVersion; // Must match KMP_PROTOCOL_VERSION (1)
+    uint32_t protocolVersion; // Must match KMP_PROTOCOL_VERSION (2)
     char     playerName[32];  // Null-terminated, max 31 chars
     uint8_t  gameVersionMajor;
     uint8_t  gameVersionMinor;
@@ -342,7 +354,7 @@ struct MsgC2SPositionUpdate {
 #### MsgS2CPositionUpdate (S2C_PositionUpdate)
 ```cpp
 struct MsgS2CPositionUpdate {
-    PlayerID sourcePlayer;        // Which player sent this update
+    PlayerID sourcePlayer;        // Owner of every entity in this server-relayed batch
     uint8_t  characterCount;
     // Followed by characterCount × CharacterPosition
 };
@@ -751,7 +763,7 @@ Quat decompressed = Quat::Decompress(compressedQuat);
 ### 8.1 Protocol Constants
 
 ```cpp
-KMP_PROTOCOL_VERSION    = 1        // Current protocol version
+KMP_PROTOCOL_VERSION    = 2        // Current protocol version
 KMP_DEFAULT_PORT        = 27800    // Default game server port
 KMP_MAX_PLAYERS         = 16       // Maximum concurrent players
 KMP_MAX_NAME_LENGTH     = 31       // Player name limit (32 bytes with null)
@@ -926,3 +938,4 @@ struct NetEntityId {
 ---
 
 **End of Protocol Specification**
+

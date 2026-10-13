@@ -7,7 +7,8 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-lightgrey)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 
-> ⚠️ **ALPHA STATUS:** Multiplayer is functional but in active development. See [Known Issues](#known-issues).
+> ⚠️ **ALPHA STATUS:** Source-level position and authority fixes are available. Release builds and in-game
+> validation with real clients are still pending. See [the latest fixes](docs/MULTIPLAYER-FIXES-2026-10-13.md).
 
 ---
 
@@ -15,10 +16,11 @@
 
 ```bash
 # 1. Clone
-git clone https://github.com/The404Studios/Kenshi-Online.git
+git clone --recurse-submodules https://github.com/Tobidp/Kenshi-Online.git
 cd Kenshi-Online
 
 # 2. Build
+cmake -S . -B build -A x64
 cd build
 MSBuild.exe KenshiMP.sln /p:Configuration=Release /p:Platform=x64 /m
 
@@ -35,10 +37,10 @@ KenshiMP.Injector.exe
 ## 📋 What Works
 
 ✅ **2-16 player co-op** - Connect to dedicated server  
-✅ **Real-time position sync** - See other players move  
+✅ **Position replication** - Shared position serializer and owner-grouped broadcasts; runtime validation pending  
 ✅ **Combat sync** - Death/KO events synchronized  
 ✅ **Building/Squad/Faction sync** - World state shared  
-✅ **Authority validation** - Prevents cheating (Phases 1-6 complete)  
+✅ **Authority validation** - Ownership and generation checks for position updates  
 ✅ **Late join fixed** - Players joining during loading now appear correctly  
 ✅ **Steam deadlock fixed** - 90s timeout prevents infinite loading  
 
@@ -46,6 +48,7 @@ KenshiMP.Injector.exe
 
 ## 📚 Documentation
 
+- **[Position and Authority Fixes](docs/MULTIPLAYER-FIXES-2026-10-13.md)** - Applied changes and validation limits
 - **[Architecture Overview](docs/AUTHORITY-IMPLEMENTATION-COMPLETE.md)** - Complete authority system (Phases 1-8)
 - **[Recent Fixes](docs/MULTIPLAYER-FIXES-2026-06-04.md)** - Spawn queue + timeout fixes
 - **[Build Guide](#building-from-source)** - Compilation instructions below
@@ -95,8 +98,9 @@ KenshiMP.Injector.exe
 
 ### Build
 ```bash
+git submodule update --init --recursive
+cmake -S . -B build -A x64
 cd build
-cmake ..  # Generate solution
 MSBuild.exe KenshiMP.sln /p:Configuration=Release /p:Platform=x64 /m
 ```
 
@@ -137,6 +141,8 @@ MSBuild.exe KenshiMP.sln /p:Configuration=Release /p:Platform=x64 /m
 ✅ Steam deadlock on loading → **FIXED** (90s hard timeout)  
 
 ### Current
+⚠️ Protocol **2** requires rebuilding both client and server; protocol-1 binaries cannot connect  
+⚠️ Independent faction/shared-save slots still cover two players; 16-player gameplay is not validated  
 ❌ Combat damage bars don't sync (ApplyDamage hook crash)  
 ⚠️ ReconcileLocal stub (Phase 7 prediction not impl)  
 ⚠️ AI not synchronized (local AI decisions)  
@@ -185,8 +191,9 @@ MIT License - See [LICENSE](LICENSE)
 
 ---
 
-**Last Updated:** 2026-06-04 | **Version:** 0.3.0-alpha | **Status:** ✅ Functional
+**Last Updated:** 2026-10-13 | **Version:** 0.3.0-alpha | **Protocol:** 2 | **Status:** Runtime validation pending
 
 <p align="center">
   <strong>Built with 🧠 by Claude AI and ❤️ by The404Studios</strong>
 </p>
+
