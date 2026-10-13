@@ -45,10 +45,22 @@ bool ServerAuthorityValidator::CanClientCommandEntity(
 bool ServerAuthorityValidator::ValidatePositionUpdate(
     PlayerID clientPlayerId,
     EntityID entityId,
+    uint32_t generation,
     const std::unordered_map<EntityID, ServerEntity>& entities
 ) {
-    // Position updates use the same validation as other commands
-    return CanClientCommandEntity(clientPlayerId, entityId, entities);
+    if (!CanClientCommandEntity(clientPlayerId, entityId, entities)) {
+        return false;
+    }
+
+    const ServerEntity& entity = entities.find(entityId)->second;
+    if (entity.generation != generation) {
+        spdlog::warn("[ServerAuth] Player {} sent entity {} generation {} (expected {})",
+                     clientPlayerId, entityId, generation, entity.generation);
+        return false;
+    }
+
+    return true;
 }
 
 } // namespace kmp
+

@@ -1,4 +1,5 @@
 #pragma once
+#include "messages.h"
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -227,4 +228,30 @@ private:
     size_t m_pos;
 };
 
+/// @brief Writes the canonical position record shared by game clients and tests.
+inline void WriteCharacterPosition(PacketWriter& writer, const CharacterPosition& position) {
+    writer.WriteU32(position.entityId);
+    writer.WriteU32(position.generation);
+    writer.WriteF32(position.posX);
+    writer.WriteF32(position.posY);
+    writer.WriteF32(position.posZ);
+    writer.WriteU32(position.compressedQuat);
+    writer.WriteU8(position.animStateId);
+    writer.WriteU8(position.moveSpeed);
+    writer.WriteU16(position.flags);
+}
+
+/// @brief Reads one complete position record without consuming truncated records.
+inline bool ReadCharacterPosition(PacketReader& reader, CharacterPosition& position) {
+    if (reader.Remaining() < KMP_CHARACTER_POSITION_SIZE) {
+        return false;
+    }
+
+    return reader.ReadU32(position.entityId) && reader.ReadU32(position.generation) &&
+           reader.ReadVec3(position.posX, position.posY, position.posZ) &&
+           reader.ReadU32(position.compressedQuat) && reader.ReadU8(position.animStateId) &&
+           reader.ReadU8(position.moveSpeed) && reader.ReadU16(position.flags);
+}
+
 } // namespace kmp
+

@@ -4,7 +4,7 @@
 namespace kmp {
 
 // Protocol
-constexpr uint32_t KMP_PROTOCOL_VERSION = 1;
+constexpr uint32_t KMP_PROTOCOL_VERSION = 2;
 constexpr uint16_t KMP_DEFAULT_PORT     = 27800;
 constexpr int      KMP_MAX_PLAYERS      = 16;
 constexpr int      KMP_MAX_NAME_LENGTH  = 31;
@@ -28,6 +28,8 @@ constexpr float KMP_SNAP_CORRECT_SEC    = 0.15f;   // 150ms snap correction blen
 constexpr float KMP_JITTER_EMA_ALPHA    = 0.1f;    // EMA smoothing factor for jitter estimation
 
 // Networking
+constexpr int   KMP_CHARACTER_POSITION_SIZE    = 28;
+constexpr int   KMP_MAX_POSITIONS_PER_PACKET   = 255;
 constexpr int   KMP_CHANNEL_COUNT       = 3;
 constexpr int   KMP_CHANNEL_RELIABLE_ORDERED   = 0;
 constexpr int   KMP_CHANNEL_RELIABLE_UNORDERED = 1;
@@ -68,3 +70,4 @@ constexpr uint32_t KMP_ID_SQUAD_MIN      = 24576;
 constexpr uint32_t KMP_ID_SQUAD_MAX      = 32767;
 
 } // namespace kmp
+

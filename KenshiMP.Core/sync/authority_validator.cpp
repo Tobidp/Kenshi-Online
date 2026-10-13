@@ -34,12 +34,7 @@ SnapshotDecision AuthorityValidator::ValidateInboundSnapshot(
     // 4. Check ownership
     uint32_t ownerPlayerId = registry.GetOwnerPlayerId(pos.entityId);
 
-    // 4a. My own entity coming back from server → reconcile prediction
-    if (ownerPlayerId == myPlayerId) {
-        return SnapshotDecision::ReconcileLocal;
-    }
-
-    // 4b. Source doesn't own this entity → authority violation
+    // Validate the relayed owner before accepting local prediction echoes.
     if (ownerPlayerId != sourcePlayerId) {
         spdlog::warn(
             "[AuthorityValidator] Authority violation: entity {} owned by player {} "
@@ -47,6 +42,10 @@ SnapshotDecision AuthorityValidator::ValidateInboundSnapshot(
             pos.entityId, ownerPlayerId, sourcePlayerId
         );
         return SnapshotDecision::RejectAuthorityViolation;
+    }
+
+    if (ownerPlayerId == myPlayerId) {
+        return SnapshotDecision::ReconcileLocal;
     }
 
     // 4c. Remote or server-owned entity with valid owner → apply
@@ -63,3 +62,4 @@ SnapshotDecision AuthorityValidator::ValidateInboundSnapshot(
 }
 
 } // namespace kmp
+

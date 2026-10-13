@@ -3040,14 +3040,17 @@ void Core::PollLocalPositions() {
         PacketWriter writer;
         writer.WriteHeader(MessageType::C2S_PositionUpdate);
         writer.WriteU8(1);
-        writer.WriteU32(netId);
-        writer.WriteF32(pos.x);
-        writer.WriteF32(pos.y);
-        writer.WriteF32(pos.z);
-        writer.WriteU32(compQuat);
-        writer.WriteU8(animState);
-        writer.WriteU8(moveSpeedU8);
-        writer.WriteU16(flags);
+        CharacterPosition position{};
+        position.entityId = netId;
+        position.generation = infoCopy->generation;
+        position.posX = pos.x;
+        position.posY = pos.y;
+        position.posZ = pos.z;
+        position.compressedQuat = compQuat;
+        position.animStateId = animState;
+        position.moveSpeed = moveSpeedU8;
+        position.flags = flags;
+        WriteCharacterPosition(writer, position);
 
         m_client.SendUnreliable(writer.Data(), writer.Size());
 
@@ -3650,7 +3653,7 @@ void Core::BackgroundReadEntities() {
         cached.dirty = true;
         writeFrame.localEntities.push_back(cached);
 
-        PendingPos pp;
+        PendingPos pp{};
         pp.cp.entityId = netId;
         pp.cp.generation = infoCopy.generation; // Phase 6: send current generation
         pp.cp.posX = pos.x;
@@ -3672,7 +3675,7 @@ void Core::BackgroundReadEntities() {
         writer.WriteHeader(MessageType::C2S_PositionUpdate);
         writer.WriteU8(static_cast<uint8_t>(pendingPositions.size()));
         for (auto& pp : pendingPositions) {
-            writer.WriteRaw(&pp.cp, sizeof(pp.cp));
+            WriteCharacterPosition(writer, pp.cp);
             // Update registry tracking (shared_mutex inside)
             m_entityRegistry.UpdatePosition(pp.netId, pp.pos);
             m_entityRegistry.UpdateRotation(pp.netId, pp.rot);
@@ -3848,3 +3851,4 @@ bool Core::TeleportToNearestRemotePlayer() {
 }
 
 } // namespace kmp
+

@@ -841,8 +841,10 @@ private:
 
         bool fedSharedSync = false;
         for (uint8_t i = 0; i < count; i++) {
-            CharacterPosition pos;
-            if (!reader.ReadRaw(&pos, sizeof(pos))) break;
+            CharacterPosition pos{};
+            if (!ReadCharacterPosition(reader, pos)) {
+                break;
+            }
 
             // Validate position: reject NaN/Inf to prevent corrupting interpolation state
             if (std::isnan(pos.posX) || std::isnan(pos.posY) || std::isnan(pos.posZ) ||
@@ -1939,3 +1941,4 @@ void ProcessDeferredSpawn(const DeferredSpawn& ds) {
 }
 
 } // namespace kmp
+

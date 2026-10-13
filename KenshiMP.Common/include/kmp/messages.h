@@ -56,13 +56,16 @@ struct CharacterPosition {
     uint16_t flags;          // Bit 0: running, Bit 1: sneaking, Bit 2: in combat
 };
 
+static_assert(sizeof(CharacterPosition) == KMP_CHARACTER_POSITION_SIZE,
+              "CharacterPosition must match the position wire format");
+
 struct MsgC2SPositionUpdate {
     uint8_t characterCount;
     // Followed by characterCount × CharacterPosition
 };
 
 struct MsgS2CPositionUpdate {
-    PlayerID sourcePlayer;
+    PlayerID sourcePlayer; // Owner of every entity in this server-relayed batch
     uint8_t  characterCount;
     // Followed by characterCount × CharacterPosition
 };
@@ -400,3 +403,4 @@ struct MsgMasterServerEntry {
 #pragma pack(pop)
 
 } // namespace kmp
+

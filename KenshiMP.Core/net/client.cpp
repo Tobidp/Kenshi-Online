@@ -144,7 +144,7 @@ void NetworkClient::Update() {
             break;
 
         case ENET_EVENT_TYPE_RECEIVE:
-            if (m_callback) {
+            if (event.peer == m_serverPeer && m_callback) {
                 m_callback(event.packet->data, event.packet->dataLength,
                           event.channelID);
             }
@@ -196,3 +196,4 @@ uint32_t NetworkClient::GetPing() const {
 }
 
 } // namespace kmp
+

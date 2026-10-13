@@ -9,6 +9,15 @@
 namespace kmp {
 
 namespace {
+constexpr uint32_t POSITION_PACKET_FLAGS = 0;
+constexpr size_t POSITION_MESSAGE_OVERHEAD = sizeof(PacketHeader) + sizeof(MsgS2CPositionUpdate);
+constexpr size_t ENET_POSITION_OVERHEAD = sizeof(ENetProtocolHeader) + sizeof(ENetProtocolSendFragment);
+
+struct PositionBatch {
+    size_t firstEntity;
+    size_t entityCount;
+};
+
 // True when this ENet address is 127.0.0.1 (network byte order = 0x0100007F).
 // Used to detect the integrated-host client: the injector launches server.exe
 // and connects from loopback, so this peer is authoritative even if a LAN
@@ -616,6 +625,8 @@ void GameServer::HandleHandshake(ENetPeer* peer, PacketReader& reader) {
             auto entIt = m_entities.find(eid);
             if (entIt != m_entities.end() && entIt->second.owner == 0) {
                 entIt->second.owner = id;
+                entIt->second.authority = entIt->second.type == EntityType::PlayerCharacter
+                    ? AuthorityType::Player : AuthorityType::Server;
                 m_players[id].ownedEntities.push_back(eid);
                 reclaimed++;
             }
@@ -793,8 +804,10 @@ void GameServer::HandlePositionUpdate(ConnectedPlayer& player, PacketReader& rea
 
     bool playerPosUpdated = false;
     for (uint8_t i = 0; i < count; i++) {
-        CharacterPosition pos;
-        if (!reader.ReadRaw(&pos, sizeof(pos))) break;
+        CharacterPosition pos{};
+        if (!ReadCharacterPosition(reader, pos)) {
+            break;
+        }
 
         // Validate coordinates — reject NaN/inf/extreme values to prevent client crashes
         if (std::isnan(pos.posX) || std::isnan(pos.posY) || std::isnan(pos.posZ) ||
@@ -808,7 +821,8 @@ void GameServer::HandlePositionUpdate(ConnectedPlayer& player, PacketReader& rea
 
         // === SERVER AUTHORITY VALIDATION (Phase 5) ===
         // Reject updates for entities the client doesn't own
-        if (!ServerAuthorityValidator::ValidatePositionUpdate(player.id, pos.entityId, m_entities)) {
+        if (!ServerAuthorityValidator::ValidatePositionUpdate(
+                player.id, pos.entityId, pos.generation, m_entities)) {
             continue; // Authority violation logged inside validator
         }
 
@@ -1005,48 +1019,95 @@ void GameServer::HandleBuildRequest(ConnectedPlayer& player, PacketReader& reade
 }
 
 void GameServer::BroadcastPositions() {
-    // Collect all entity positions and broadcast to relevant players
-    // (zone-based interest management)
-    for (auto& [playerId, player] : m_players) {
-        PacketWriter writer;
-        writer.WriteHeader(MessageType::S2C_PositionUpdate);
-
-        // Collect all non-owned entities (zone filtering disabled for small
-        // player counts — 16-slot server doesn't need spatial culling, and
-        // zone mismatch was preventing players from ever seeing each other).
-        std::vector<const ServerEntity*> nearby;
-        for (auto& [entityId, entity] : m_entities) {
-            if (entity.owner == playerId) continue; // Don't send own entities back
-            nearby.push_back(&entity);
+    std::vector<const ServerEntity*> entities;
+    entities.reserve(m_entities.size());
+    for (const auto& [entityId, entity] : m_entities) {
+        entities.push_back(&entity);
+    }
+    std::sort(entities.begin(), entities.end(), [](const auto* first, const auto* second) {
+        if (first->owner != second->owner) {
+            return first->owner < second->owner;
         }
+        return first->id < second->id;
+    });
 
-        if (nearby.empty()) continue;
-
-        writer.WriteU32(0); // sourcePlayer = server
-        size_t sendCount = std::min(nearby.size(), size_t(255));
-        writer.WriteU8(static_cast<uint8_t>(sendCount));
-
-        for (size_t i = 0; i < sendCount; i++) {
-            auto* entity = nearby[i];
-            CharacterPosition pos;
-            pos.entityId = entity->id;
-            pos.generation = entity->generation; // Phase 6: include generation
-            pos.posX = entity->position.x;
-            pos.posY = entity->position.y;
-            pos.posZ = entity->position.z;
-            pos.compressedQuat = entity->rotation.Compress();
-            pos.animStateId = entity->animState;
-            pos.moveSpeed = entity->moveSpeed;
-            pos.flags = entity->flags;
-            writer.WriteRaw(&pos, sizeof(pos));
-        }
-
-        ENetPacket* pkt = enet_packet_create(writer.Data(), writer.Size(), 0);
-        if (!pkt) {
-            spdlog::error("Failed to create packet ({} bytes)", writer.Size());
+    for (const auto& [playerId, player] : m_players) {
+        if (!player.peer || player.peer->state != ENET_PEER_STATE_CONNECTED) {
             continue;
         }
-        enet_peer_send(player.peer, KMP_CHANNEL_UNRELIABLE_SEQ, pkt);
+
+        // ENet promotes oversized flags=0 packets to reliable fragments. Stay below
+        // its fragment threshold to keep each page independently replaceable next tick.
+        size_t transportOverhead = ENET_POSITION_OVERHEAD;
+        if (player.peer->host->checksum) {
+            transportOverhead += sizeof(enet_uint32);
+        }
+        size_t minimumPacketSize = transportOverhead + POSITION_MESSAGE_OVERHEAD + KMP_CHARACTER_POSITION_SIZE;
+        if (player.peer->mtu < minimumPacketSize) {
+            spdlog::warn("GameServer: Cannot send positions to player {} at tick {} (MTU {})",
+                         playerId, m_serverTick, player.peer->mtu);
+            continue;
+        }
+        size_t packetBudget = player.peer->mtu - transportOverhead - POSITION_MESSAGE_OVERHEAD;
+        size_t maxCount = std::min(static_cast<size_t>(KMP_MAX_POSITIONS_PER_PACKET),
+                                   packetBudget / KMP_CHARACTER_POSITION_SIZE);
+
+        std::vector<PositionBatch> batches;
+        for (size_t firstEntity = 0; firstEntity < entities.size();) {
+            PlayerID sourcePlayer = entities[firstEntity]->owner;
+            size_t ownerEnd = firstEntity;
+            while (ownerEnd < entities.size() && entities[ownerEnd]->owner == sourcePlayer) {
+                ownerEnd++;
+            }
+            if (sourcePlayer != playerId) {
+                for (size_t offset = firstEntity; offset < ownerEnd; offset += maxCount) {
+                    batches.push_back({offset, std::min(maxCount, ownerEnd - offset)});
+                }
+            }
+            firstEntity = ownerEnd;
+        }
+        if (batches.empty()) {
+            continue;
+        }
+
+        // Sequenced delivery may discard earlier pages after reordering. Rotate page
+        // order each tick so one fixed prefix or owner cannot monopolize delivery.
+        size_t firstBatch = m_serverTick % batches.size();
+        for (size_t batchIndex = 0; batchIndex < batches.size(); batchIndex++) {
+            const auto& batch = batches[(firstBatch + batchIndex) % batches.size()];
+            PlayerID sourcePlayer = entities[batch.firstEntity]->owner;
+            PacketWriter writer;
+            writer.WriteHeader(MessageType::S2C_PositionUpdate, 0, m_serverTick);
+            writer.WriteU32(sourcePlayer);
+            writer.WriteU8(static_cast<uint8_t>(batch.entityCount));
+
+            for (size_t index = 0; index < batch.entityCount; index++) {
+                const auto* entity = entities[batch.firstEntity + index];
+                CharacterPosition pos{};
+                pos.entityId = entity->id;
+                pos.generation = entity->generation;
+                pos.posX = entity->position.x;
+                pos.posY = entity->position.y;
+                pos.posZ = entity->position.z;
+                pos.compressedQuat = entity->rotation.Compress();
+                pos.animStateId = entity->animState;
+                pos.moveSpeed = entity->moveSpeed;
+                pos.flags = entity->flags;
+                WriteCharacterPosition(writer, pos);
+            }
+
+            ENetPacket* packet = enet_packet_create(writer.Data(), writer.Size(), POSITION_PACKET_FLAGS);
+            if (!packet) {
+                spdlog::error("GameServer: Position packet allocation failed for player {} at tick {} ({} bytes)",
+                              playerId, m_serverTick, writer.Size());
+                continue;
+            }
+            if (enet_peer_send(player.peer, KMP_CHANNEL_UNRELIABLE_SEQ, packet) < 0) {
+                spdlog::warn("GameServer: Position send failed to player {} from owner {} at tick {}",
+                             playerId, sourcePlayer, m_serverTick);
+                enet_packet_destroy(packet);
+            }
+        }
     }
 }
 
@@ -1170,6 +1231,8 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
     entity.id = serverId;
     entity.type = static_cast<EntityType>(type);
     entity.owner = player.id;
+    entity.authority = entity.type == EntityType::PlayerCharacter
+        ? AuthorityType::Player : AuthorityType::Server;
     entity.position = Vec3(px, py, pz);
     entity.rotation = Quat::Decompress(compQuat);
     entity.templateId = templateId;
@@ -1189,8 +1252,10 @@ void GameServer::HandleEntitySpawnReq(ConnectedPlayer& player, PacketReader& rea
         player.zone = entity.zone;
     }
 
-    spdlog::info("GameServer: Entity spawn req from '{}': serverID={} template='{}' at ({:.1f},{:.1f},{:.1f})",
-                 player.name, serverId, templateName, px, py, pz);
+    spdlog::info("GameServer: Player {} ('{}') spawned entity {} generation {} authority {} "
+                 "template='{}' at ({:.1f},{:.1f},{:.1f})",
+                 player.id, player.name, serverId, entity.generation, static_cast<int>(entity.authority),
+                 templateName, px, py, pz);
 
     // Broadcast S2C_EntitySpawn to ALL clients (including the host, so they get the server ID)
     PacketWriter writer;
@@ -2465,3 +2530,4 @@ int GameServer::GetConnectedPlayerCount() const {
 }
 
 } // namespace kmp
+

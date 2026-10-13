@@ -145,6 +145,9 @@ bool LoadWorldFromFile(const std::string& path,
             entity.id = e["id"];
             entity.type = static_cast<EntityType>(e["type"].get<int>());
             entity.owner = 0; // Mark all loaded entities as unowned until a player reconnects
+            // Old save files have no authority field; recover it from the entity type.
+            entity.authority = entity.type == EntityType::PlayerCharacter
+                ? AuthorityType::Player : AuthorityType::Server;
             entity.templateId = e["templateId"];
             entity.factionId = e["factionId"];
 
@@ -219,3 +222,4 @@ bool LoadWorldFromFile(const std::string& path,
 }
 
 } // namespace kmp
+

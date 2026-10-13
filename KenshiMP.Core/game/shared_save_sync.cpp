@@ -19,8 +19,8 @@ namespace kmp::shared_save_sync {
 //  Both players load the SAME save with kenshi-online.mod.
 //  The mod defines "Player 1" and "Player 2" factions + characters.
 //  Server assigns each player a faction string:
-//    "10-kenshi-online" → you control "Player 1", other player is "Player 2"
-//    "12-kenshi-online" → you control "Player 2", other player is "Player 1"
+//    "10-kenshi-online.mod" → you control "Player 1", other player is "Player 2"
+//    "12-kenshi-online.mod" → you control "Player 2", other player is "Player 1"
 //  Characters already exist in the save — no factory spawning needed.
 //  We just find them by name and sync positions.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -55,14 +55,22 @@ static std::atomic<float> s_remoteGameSpeed{-1.f};
 
 // ── Faction string → character name mapping ──
 static std::string FactionToOwnName(const std::string& faction) {
-    if (faction == "10-kenshi-online") return "Player 1";
-    if (faction == "12-kenshi-online") return "Player 2";
+    if (faction == "10-kenshi-online.mod") {
+        return "Player 1";
+    }
+    if (faction == "12-kenshi-online.mod") {
+        return "Player 2";
+    }
     return "";
 }
 
 static std::string FactionToOtherName(const std::string& faction) {
-    if (faction == "10-kenshi-online") return "Player 2";
-    if (faction == "12-kenshi-online") return "Player 1";
+    if (faction == "10-kenshi-online.mod") {
+        return "Player 2";
+    }
+    if (faction == "12-kenshi-online.mod") {
+        return "Player 1";
+    }
     return "";
 }
 
@@ -275,28 +283,26 @@ void Update(float deltaTime) {
         s_lastPosSend = now;
 
         Vec3 myPos;
-        if (SEH_ReadAnimClassPosition(s_ownAnimClass, myPos)) {
-            // Use the existing position update format — the server reads:
-            // U32(sourcePlayer) [handled by server from peer], U8(count), then
-            // CharacterPosition structs. We need to match this EXACTLY.
+        const EntityID entityId = core.GetEntityRegistry().GetNetId(s_ownCharPtr);
+        const auto entityInfo = core.GetEntityRegistry().GetInfo(entityId);
+        if (entityInfo && entityInfo->ownerPlayerId == core.GetLocalPlayerId() &&
+            !entityInfo->isRemote && SEH_ReadAnimClassPosition(s_ownAnimClass, myPos)) {
+            // Wait for normal registration instead of sending an invalid avatar ID.
             PacketWriter writer;
             writer.WriteHeader(MessageType::C2S_PositionUpdate);
-            // The server reads sourcePlayer as U32 first, but the canonical client
-            // code (core.cpp PollLocalPositions) writes U8(count) first, then
-            // CharacterPosition structs. Let me match the canonical format.
-            writer.WriteU8(1); // count = 1 (FIX: was U32, must be U8)
+            writer.WriteU8(1);
 
-            // CharacterPosition struct — must match the server's ReadRaw size
             CharacterPosition cp{};
-            cp.entityId = 0; // Shared-save mode uses entityId 0 as "player avatar"
+            cp.entityId = entityId;
+            cp.generation = entityInfo->generation;
             cp.posX = myPos.x;
             cp.posY = myPos.y;
             cp.posZ = myPos.z;
-            cp.compressedQuat = 0;
-            cp.animStateId = 0;
-            cp.moveSpeed = 0;
+            cp.compressedQuat = entityInfo->lastRotation.Compress();
+            cp.animStateId = entityInfo->animState;
+            cp.moveSpeed = entityInfo->moveSpeed;
             cp.flags = 0;
-            writer.WriteRaw(&cp, sizeof(cp));
+            WriteCharacterPosition(writer, cp);
 
             core.GetClient().SendUnreliable(writer.Data(), writer.Size());
         }
@@ -350,3 +356,4 @@ const std::string& GetOwnCharacterName() { return s_ownCharName; }
 const std::string& GetOtherCharacterName() { return s_otherCharName; }
 
 } // namespace kmp::shared_save_sync
+
