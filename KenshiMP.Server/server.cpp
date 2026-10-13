@@ -2036,7 +2036,7 @@ void GameServer::HandleCombatDeath(ConnectedPlayer& player, PacketReader& reader
 
     spdlog::info("GameServer: Player '{}' reports entity {} death (killer={}, reporter={})",
                  player.name, msg.entityId, msg.killerId,
-                 victimIsReporter ? "victim-owner" : "killer-owner");
+                 it->second.owner == player.id ? "owner" : "host");
 
     // Broadcast death to ALL players (including reporter for authoritative sync)
     PacketWriter writer;

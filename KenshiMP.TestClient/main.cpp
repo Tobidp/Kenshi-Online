@@ -299,7 +299,7 @@ static void HandlePacket(const uint8_t* data, size_t len) {
             static int timeSyncCount = 0;
             timeSyncCount++;
             if (timeSyncCount <= 2 || timeSyncCount % 10 == 0) {
-                printf("[<] TimeSync: tick=%u tod=%.2f speed=%u\n",
+                printf("[<] TimeSync: tick=%u tod=%.2f speed=%.2f\n",
                        ts.serverTick, ts.timeOfDay, ts.gameSpeed);
             }
         }
