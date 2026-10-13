@@ -1,6 +1,6 @@
 # Kenshi-Online Network Protocol Specification
 
-**Version:** 2  
+**Version:** 3  
 **Last Updated:** 2026-10-13  
 **Authors:** KenshiMP Development Team
 
@@ -29,12 +29,12 @@ Kenshi-Online uses a client-server architecture with authoritative server design
 - **Zone-based interest management** (3×3 grid, 750m zones)
 - **Entity generation counters** to prevent ghost control bugs
 
-**Protocol Version:** `2`  
+**Protocol Version:** `3`  
 **Default Port:** `27800`
 
-Protocol 2 requires rebuilding both client and server. Position records are 28 bytes,
-including generation immediately after entityId, and use the shared WriteCharacterPosition
-and ReadCharacterPosition helpers. Protocol-1 peers are rejected during the handshake.
+Protocol 3 requires rebuilding both client and server. Position records are 32 bytes,
+including generation and inputSequence after entityId, and use the shared WriteCharacterPosition
+and ReadCharacterPosition helpers. Older peers are rejected during the handshake.
 
 Every server position packet groups entities by owner; sourcePlayer is that owner, not
 the server connection ID. Server-owned entities use sourcePlayer=0. Batches fit the peer
@@ -43,6 +43,12 @@ discard earlier packets after reordering. In-game and 16-player validation remai
 
 Position updates now check generation on both endpoints. Generation allocation/reuse,
 spawn/despawn propagation, and persistence still need a complete lifecycle implementation.
+
+inputSequence identifies a locally recorded position sample. The server echoes the latest processed
+sequence to its owner as well as remote observers. The owner uses it to compute a correction against
+the acknowledged sample, preserving movement after that sample. This is state-based reconciliation,
+not deterministic input replay. Limb-health records now include generation (36-byte record body).
+Only the actor's owner, or the current host for owner-zero world NPCs, may publish their health.
 
 ---
 
@@ -249,7 +255,7 @@ struct PacketHeader {
 #### MsgHandshake (C2S_Handshake)
 ```cpp
 struct MsgHandshake {
-    uint32_t protocolVersion; // Must match KMP_PROTOCOL_VERSION (2)
+    uint32_t protocolVersion; // Must match KMP_PROTOCOL_VERSION (3)
     char     playerName[32];  // Null-terminated, max 31 chars
     uint8_t  gameVersionMajor;
     uint8_t  gameVersionMinor;
@@ -335,6 +341,7 @@ struct MsgEntityDespawn {
 struct CharacterPosition {
     EntityID entityId;
     uint32_t generation;          // Verify entity identity
+    uint32_t inputSequence;       // Client sample sequence, acknowledged by the server
     float    posX, posY, posZ;
     uint32_t compressedQuat;      // Smallest-three quaternion (10 bits/component)
     uint8_t  animStateId;         // Animation state enum
@@ -400,6 +407,7 @@ struct MsgCombatDeath {
 ```cpp
 struct MsgHealthUpdate {
     EntityID entityId;
+    uint32_t generation;
     float    health[7];       // Per body part: Head, Chest, Stomach, LArm, RArm, LLeg, RLeg
     float    bloodLevel;      // 0.0 to 100.0
 };
@@ -409,6 +417,7 @@ struct MsgHealthUpdate {
 ```cpp
 struct MsgLimbHealth {
     EntityID entityId;
+    uint32_t generation;
     float    health[7];       // Head, Chest, Stomach, LArm, RArm, LLeg, RLeg
 };
 ```
@@ -763,7 +772,7 @@ Quat decompressed = Quat::Decompress(compressedQuat);
 ### 8.1 Protocol Constants
 
 ```cpp
-KMP_PROTOCOL_VERSION    = 2        // Current protocol version
+KMP_PROTOCOL_VERSION    = 3        // Current protocol version
 KMP_DEFAULT_PORT        = 27800    // Default game server port
 KMP_MAX_PLAYERS         = 16       // Maximum concurrent players
 KMP_MAX_NAME_LENGTH     = 31       // Player name limit (32 bytes with null)

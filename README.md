@@ -49,6 +49,7 @@ KenshiMP.Injector.exe
 ## 📚 Documentation
 
 - **[Position and Authority Fixes](docs/MULTIPLAYER-FIXES-2026-10-13.md)** - Applied changes and validation limits
+- **[Health, Prediction and NPC Status](docs/GAMEPLAY-SYNC-2026-10-13.md)** - Applied code and experimental limits
 - **[Architecture Overview](docs/AUTHORITY-IMPLEMENTATION-COMPLETE.md)** - Complete authority system (Phases 1-8)
 - **[Recent Fixes](docs/MULTIPLAYER-FIXES-2026-06-04.md)** - Spawn queue + timeout fixes
 - **[Build Guide](#building-from-source)** - Compilation instructions below
@@ -141,11 +142,11 @@ MSBuild.exe KenshiMP.sln /p:Configuration=Release /p:Platform=x64 /m
 ✅ Steam deadlock on loading → **FIXED** (90s hard timeout)  
 
 ### Current
-⚠️ Protocol **2** requires rebuilding both client and server; protocol-1 binaries cannot connect  
+⚠️ Protocol **3** requires rebuilding both client and server; older protocol binaries cannot connect  
 ⚠️ Independent faction/shared-save slots still cover two players; 16-player gameplay is not validated  
-❌ Combat damage bars don't sync (ApplyDamage hook crash)  
-⚠️ ReconcileLocal stub (Phase 7 prediction not impl)  
-⚠️ AI not synchronized (local AI decisions)  
+⚠️ Limb health polling and queued application are implemented; in-game health-bar validation is pending  
+⚠️ Local position reconciliation is implemented; deterministic Kenshi input replay is unavailable  
+⚠️ World NPC state replication is experimental and disabled by default; AI decisions are not suppressed  
 
 See [docs/MULTIPLAYER-FIXES-2026-06-04.md](docs/MULTIPLAYER-FIXES-2026-06-04.md) for details.
 
@@ -191,7 +192,7 @@ MIT License - See [LICENSE](LICENSE)
 
 ---
 
-**Last Updated:** 2026-10-13 | **Version:** 0.3.0-alpha | **Protocol:** 2 | **Status:** Runtime validation pending
+**Last Updated:** 2026-10-13 | **Version:** 0.3.0-alpha | **Protocol:** 3 | **Status:** Runtime validation pending
 
 <p align="center">
   <strong>Built with 🧠 by Claude AI and ❤️ by The404Studios</strong>
