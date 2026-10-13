@@ -88,24 +88,26 @@ static bool SEH_AllyModFaction(void* character) {
     }
 }
 
-static bool SEH_WriteLimbHealthToChar(void* character, const float health[7]) {
-    __try {
-        auto& offsets = game::GetOffsets().character;
-        uintptr_t charPtr = reinterpret_cast<uintptr_t>(character);
-        if (offsets.healthChain1 < 0 || offsets.healthChain2 < 0 || offsets.healthBase < 0)
-            return false;
-        uintptr_t ptr1 = 0;
-        if (!Memory::Read(charPtr + offsets.healthChain1, ptr1) || ptr1 == 0) return false;
-        uintptr_t ptr2 = 0;
-        if (!Memory::Read(ptr1 + offsets.healthChain2, ptr2) || ptr2 == 0) return false;
-        for (int i = 0; i < 7; i++) {
-            int partOffset = offsets.healthBase + i * offsets.healthStride;
-            Memory::Write(ptr2 + partOffset, health[i]);
-        }
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+static bool SEH_WriteLimbHealthToChar(void* character, const float health[KMP_LIMB_COUNT]) {
+    return game::CharacterAccessor(character).WriteLimbHealth(health);
+}
+
+static bool CallRemoteCharacterDeath(void* character, void* killer) {
+    const auto address = Core::Get().GetGameFunctions().CharacterDeath;
+    if (!address || !character) {
         return false;
     }
+    const auto deathFn = reinterpret_cast<CharacterDeathFn>(address);
+    bool applied = false;
+    combat_hooks::SetServerSourcedDeath(true);
+    __try {
+        deathFn(character, killer);
+        applied = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        applied = false;
+    }
+    combat_hooks::SetServerSourcedDeath(false);
+    return applied;
 }
 
 // Handles incoming packets from the server and dispatches to appropriate systems.
@@ -1030,160 +1032,94 @@ private:
 
     // ── Combat Death ──
     static void HandleCombatDeath(PacketReader& reader) {
-        MsgCombatDeath msg;
-        if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-        spdlog::info("PacketHandler: Entity {} killed by {}", msg.entityId, msg.killerId);
-
+        MsgCombatDeath msg{};
+        if (!reader.ReadRaw(&msg, sizeof(msg))) {
+            return;
+        }
         auto& core = Core::Get();
-        if (!core.IsGameLoaded()) return;
         auto& registry = core.GetEntityRegistry();
-        auto& funcs = core.GetGameFunctions();
-
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        if (!entityObj) return;
-
-        bool appliedNative = false;
-        if (funcs.CharacterDeath) {
-            void* killerObj = (msg.killerId != INVALID_ENTITY)
-                ? registry.GetGameObject(msg.killerId) : nullptr;
-            // FIXED: Queue death execution for game thread
-            // Capture by VALUE - get Core via singleton in lambda
-            core.GetCommandQueue().Push({[entityObj, killerObj, msg]() {
-                auto& core = Core::Get();
-                auto& funcs = core.GetGameFunctions();
-                bool appliedNative = false;
-
-                // Try native death fn. Pass killerObj even if nullptr — the
-                // game's CharacterDeath at 0x7A6200 accepts nullptr killer
-                // (environment/bleed-out deaths use nullptr internally).
-                // Set echo suppression flag so Hook_CharacterDeath doesn't
-                // re-queue this death as a new C2S event.
-                auto deathFn = reinterpret_cast<CharacterDeathFn>(funcs.CharacterDeath);
-                bool deathCrashed = false;
-                combat_hooks::SetServerSourcedDeath(true);
-                __try {
-                    deathFn(entityObj, killerObj);
-                    appliedNative = true;
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    deathCrashed = true;
-                }
-                combat_hooks::SetServerSourcedDeath(false);
-                if (deathCrashed) {
-                    spdlog::warn("PacketHandler: Native CharacterDeath crashed for entity {} — using fallback",
-                                 msg.entityId);
-                }
-
-                if (!appliedNative) {
-                    // Fallback: set all 7 body part health values to -100 via health chain.
-                    // This triggers the game's own death detection (health < 0 on vital part).
-                    // The isAlive offset is -1 (undiscovered), so we use the verified
-                    // health chain: char+0x2B8 -> +0x5F8 -> +0x40 + part*8
-                    auto& offsets = game::GetOffsets().character;
-                    uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-                    if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                        uintptr_t ptr1 = 0;
-                        if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                            uintptr_t ptr2 = 0;
-                            if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                                // Write -100 to all 7 body parts (head, chest, stomach, left arm, right arm, left leg, right leg)
-                                for (int i = 0; i < 7; i++) {
-                                    int partOffset = offsets.healthBase + i * offsets.healthStride;
-                                    float deathHealth = -100.f;
-                                    Memory::Write(ptr2 + partOffset, deathHealth);
-                                }
-                                spdlog::info("PacketHandler: Death fallback — set all body parts to -100 for entity {}", msg.entityId);
-                            }
-                        }
-                    }
-
-                    // Also try isAlive flag if we ever discover it
-                    if (offsets.isAlive >= 0) {
-                        bool dead = false;
-                        Memory::Write(charPtr + offsets.isAlive, dead);
-                    }
-                }
-            }});
+        const auto info = registry.GetInfo(msg.entityId);
+        if (!core.IsGameLoaded() || !info) {
+            return;
         }
-
-        // Update entity registry — all limbs to -100 for death
-        {
-            float limbs[7];
-            for (int i = 0; i < 7; i++) limbs[i] = -100.f;
-            registry.UpdateLimbHealth(msg.entityId, limbs);
-        }
+        const auto killerInfo = registry.GetInfo(msg.killerId);
+        const uint32_t generation = info->generation;
+        const uint32_t killerGeneration = killerInfo ? killerInfo->generation : 0;
+        const bool hasKiller = killerInfo.has_value();
+        const uint64_t sessionEpoch = core.GetSessionEpoch();
+        core.GetCommandQueue().Push({[msg, generation, killerGeneration, hasKiller, sessionEpoch]() {
+            auto& core = Core::Get();
+            auto& registry = core.GetEntityRegistry();
+            const auto current = registry.GetInfo(msg.entityId);
+            if (!core.IsConnected() || core.GetSessionEpoch() != sessionEpoch ||
+                !core.IsGameLoaded() || !current || current->generation != generation ||
+                !current->gameObject) {
+                return;
+            }
+            // The reporting simulator already executed its native death.
+            if (CanPublishSimulation(current->type, current->ownerPlayerId, core.GetLocalPlayerId(),
+                core.IsHost(), current->isRemote, current->state, true)) {
+                return;
+            }
+            void* killer = nullptr;
+            const auto currentKiller = registry.GetInfo(msg.killerId);
+            if (hasKiller && currentKiller && currentKiller->generation == killerGeneration) {
+                killer = currentKiller->gameObject;
+            }
+            const bool appliedNative = CallRemoteCharacterDeath(current->gameObject, killer);
+            float health[KMP_LIMB_COUNT];
+            std::fill(health, health + KMP_LIMB_COUNT, -100.f);
+            if (!appliedNative) {
+                // Native execution can change entity lifetime; resolve once more before fallback.
+                const auto fallback = registry.GetInfo(msg.entityId);
+                if (!fallback || fallback->generation != generation || !fallback->gameObject ||
+                    !game::CharacterAccessor(fallback->gameObject).WriteLimbHealth(health)) {
+                    return;
+                }
+            }
+            registry.UpdateLimbHealth(msg.entityId, health);
+        }});
     }
 
     // ── Combat KO ──
     static void HandleCombatKO(PacketReader& reader) {
-        MsgCombatKO msg;
-        if (!reader.ReadRaw(&msg, sizeof(msg))) return;
-
-        // Validate body part to prevent out-of-bounds memory writes
-        if (msg.bodyPart >= static_cast<uint8_t>(BodyPart::Count)) return;
-
-        spdlog::info("PacketHandler: Entity {} KO'd by {} (part={}, hp={:.1f})",
-                     msg.entityId, msg.attackerId, msg.bodyPart, msg.resultHealth);
-
+        MsgCombatKO msg{};
+        if (!reader.ReadRaw(&msg, sizeof(msg)) ||
+            msg.bodyPart >= static_cast<uint8_t>(BodyPart::Count) ||
+            !std::isfinite(msg.resultHealth)) {
+            return;
+        }
         auto& core = Core::Get();
-        if (!core.IsGameLoaded()) return;
-        auto& registry = core.GetEntityRegistry();
-        auto& funcs = core.GetGameFunctions();
-
-        void* entityObj = registry.GetGameObject(msg.entityId);
-        bool appliedNativeKO = false;
-        if (entityObj && funcs.CharacterKO) {
-            void* attackerObj = (msg.attackerId != INVALID_ENTITY)
-                ? registry.GetGameObject(msg.attackerId) : nullptr;
-            // Set echo suppression flag so Hook_CharacterKO doesn't
-            // re-queue this KO as a new C2S event.
-            auto koFn = reinterpret_cast<game::func_types::CharacterKOFn>(funcs.CharacterKO);
-            bool koCrashed = false;
-            combat_hooks::SetServerSourcedKO(true);
-            __try {
-                koFn(entityObj, attackerObj, static_cast<int>(msg.bodyPart));
-                appliedNativeKO = true;
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                koCrashed = true;
-            }
-            combat_hooks::SetServerSourcedKO(false);
-            if (koCrashed) {
-                spdlog::warn("PacketHandler: Native CharacterKO crashed for entity {} — using fallback",
-                             msg.entityId);
-            }
+        const auto info = core.GetEntityRegistry().GetInfo(msg.entityId);
+        if (!core.IsGameLoaded() || !info) {
+            return;
         }
-        if (entityObj && !appliedNativeKO) {
-            // Fallback: write the health value directly to trigger KO state
-            auto& offsets = game::GetOffsets().character;
-            uintptr_t charPtr = reinterpret_cast<uintptr_t>(entityObj);
-
-            if (offsets.healthChain1 >= 0 && offsets.healthChain2 >= 0 && offsets.healthBase >= 0) {
-                uintptr_t ptr1 = 0;
-                if (Memory::Read(charPtr + offsets.healthChain1, ptr1) && ptr1 != 0) {
-                    uintptr_t ptr2 = 0;
-                    if (Memory::Read(ptr1 + offsets.healthChain2, ptr2) && ptr2 != 0) {
-                        // msg.bodyPart is actually the KO *reason* (0=blood loss,
-                        // 1=head trauma, 2=other), NOT a body part index.
-                        // The health value sent is always chest health, so write
-                        // to body part index 0 (chest).
-                        int partOffset = offsets.healthBase + 0 * offsets.healthStride;
-                        Memory::Write(ptr2 + partOffset, msg.resultHealth);
-                    }
-                }
+        const uint32_t generation = info->generation;
+        const uint64_t sessionEpoch = core.GetSessionEpoch();
+        core.GetCommandQueue().Push({[msg, generation, sessionEpoch]() {
+            auto& core = Core::Get();
+            auto& registry = core.GetEntityRegistry();
+            const auto current = registry.GetInfo(msg.entityId);
+            if (!core.IsConnected() || core.GetSessionEpoch() != sessionEpoch ||
+                !core.IsGameLoaded() || !current || current->generation != generation ||
+                !current->gameObject) {
+                return;
             }
-        }
-
-        // Update entity registry — write KO health to chest (body part 0)
-        {
-            auto info = registry.GetInfo(msg.entityId);
-            if (info.has_value()) {
-                float limbs[7];
-                for (int i = 0; i < 7; i++) limbs[i] = info->limbs.hp[i];
-                limbs[static_cast<int>(BodyPart::Chest)] = msg.resultHealth;
-                registry.UpdateLimbHealth(msg.entityId, limbs);
+            if (CanPublishSimulation(current->type, current->ownerPlayerId, core.GetLocalPlayerId(),
+                core.IsHost(), current->isRemote, current->state, true)) {
+                return;
             }
-        }
+            // A network body part is not a native KO reason. Replicate its HP without guessing.
+            float health[KMP_LIMB_COUNT];
+            game::CharacterAccessor character(current->gameObject);
+            if (!character.ReadLimbHealth(health)) {
+                return;
+            }
+            health[msg.bodyPart] = msg.resultHealth;
+            if (character.WriteLimbHealth(health)) {
+                registry.UpdateLimbHealth(msg.entityId, health);
+            }
+        }});
     }
 
     // ── Combat Stance ──

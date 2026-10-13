@@ -9,9 +9,9 @@ não tem um hook de decisão/tick da IA verificado.
 
 | Questão | Alteração de código | Limite |
 | --- | --- | --- |
-| Barras de dano | Polling de vida dos sete membros e aplicação na thread do jogo | Interface e offsets precisam de teste no Kenshi |
-| ReconcileLocal | Histórico de amostras, confirmação de sequência e correções graduais | Reconciliação de estado, sem replay determinístico de inputs |
-| IA dos NPCs do mundo | Autoridade do host, publicação e associação de estados de NPCs carregados | Experimental; decisões locais não são suprimidas |
+| Barras de dano | Polling dos sete membros e aplicação na thread do jogo | Validar interface e offsets no Kenshi |
+| ReconcileLocal | Histórico, ACKs de sequência e correções graduais | Sem replay determinístico de inputs |
+| IA dos NPCs do mundo | Autoridade do host e réplica de NPCs carregados | Experimental; decisões locais continuam |
 
 O protocolo passa a **3**. Cliente e servidor devem ser recompilados juntos. Os binários antigos
 de dist continuam anteriores a estas mudanças.
@@ -33,6 +33,8 @@ Depois:
 - O receptor enfileira o snapshot e resolve o objeto novamente quando o comando é executado.
 - É verificado também o epoch da sessão, evitando comandos antigos após troca de save/reconexão.
 - A aplicação de CombatHit usa o estado de vida resultante; não chama ApplyDamage novamente.
+- KO e morte também entram na fila com IDs, geração e sessão; não capturam ponteiros do jogo.
+- O simulador que publicou KO/morte evita repetir sua própria execução nativa ao receber o broadcast.
 
 ~~~cpp
 // Antes: leitura podia esconder falha; envio apenas após morte/KO.
@@ -50,6 +52,25 @@ if (!accessor.ReadLimbHealth(health)) {
 Nenhum controlador de IA é zerado e o hook ApplyDamage continua desativado. A alteração permite
 sincronizar vida observada, incluindo cura e danos intermediários. Ela não cria um simulador
 completo de combate de Kenshi no servidor.
+
+O handler de KO anteriormente escrevia o índice zero como se fosse o peito e passava o membro
+como motivo nativo de KO. BodyPart::Chest é o índice 1. Agora o receptor aplica o membro informado
+pela mensagem, na thread do jogo, pelo accessor validado:
+
+~~~cpp
+// Antes: na thread de rede, confundindo motivo de KO com membro.
+koFn(entityObj, attackerObj, static_cast<int>(msg.bodyPart));
+Memory::Write(ptr2 + offsets.healthBase, msg.resultHealth);
+
+// Depois: dentro da fila, após resolver a entidade e verificar sessão/geração.
+health[msg.bodyPart] = msg.resultHealth;
+if (character.WriteLimbHealth(health)) {
+    registry.UpdateLimbHealth(msg.entityId, health);
+}
+~~~
+
+HP de KO não reproduz sozinho inconsciência por sangue ou stun. Esses estados ainda precisam de
+validação no Kenshi; a mensagem de membro não fornece um motivo nativo seguro para chamar CharacterKO.
 
 ## Reconciliação do personagem local
 
@@ -85,6 +106,10 @@ O histórico tem limite de 128 amostras por entidade. ACKs desconhecidos/antigos
 e valores inválidos são rejeitados. Erros pequenos ficam numa deadzone; erros médios são suavizados;
 deslocamentos grandes são aplicados uma vez. Uma escrita de posição que falha devolve a correção
 para tentativa posterior. Destruição de entidades e troca de sessão limpam o histórico.
+
+Quando um cliente reiniciado recupera suas entidades, o servidor zera a sequência processada
+da sessão anterior. O teste de integração verifica a identidade preservada e aceitação imediata
+do primeiro movimento depois da reconexão.
 
 Esta etapa não reproduz pathfinding, colisões ou todos os comandos do motor no servidor.
 Portanto, descreve-se como reconciliação de estado, não como rollback/replay determinístico.

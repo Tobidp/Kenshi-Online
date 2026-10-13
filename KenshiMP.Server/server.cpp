@@ -1991,9 +1991,7 @@ void GameServer::HandleCombatKO(ConnectedPlayer& player, PacketReader& reader) {
         return;
     }
 
-    // Update server-side health — 'reason' is the KO cause (0=blood loss,
-    // 1=head trauma, 2=other), NOT a body part index. The health value is
-    // always chest health, so write to health[0] (chest).
+    // The client KO reason is separate from the S2C limb enum. This sample carries chest HP.
     it->second.health[static_cast<int>(BodyPart::Chest)] = chestHealth;
     it->second.limbHealth[static_cast<int>(BodyPart::Chest)] = chestHealth;
 
